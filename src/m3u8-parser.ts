@@ -378,7 +378,8 @@ function parseByteRange(value: string): M3U8ByteRange {
   if (
     !Number.isSafeInteger(length) ||
     length <= 0 ||
-    (offset !== undefined && !Number.isSafeInteger(offset))
+    (offset !== undefined && !Number.isSafeInteger(offset)) ||
+    (offset !== undefined && !Number.isSafeInteger(offset + length - 1))
   ) {
     throw new Error('Invalid #EXT-X-BYTERANGE value');
   }
@@ -401,10 +402,11 @@ function resolveSegmentByteRange(
 
   const previous = segments[segments.length - 1];
   if (previous?.byterange && previous.uri === uri) {
-    return {
-      length: range.length,
-      offset: previous.byterange.offset + previous.byterange.length,
-    };
+    const offset = previous.byterange.offset + previous.byterange.length;
+    if (!Number.isSafeInteger(offset + range.length - 1)) {
+      throw new Error('Invalid #EXT-X-BYTERANGE value');
+    }
+    return { length: range.length, offset };
   }
 
   throw new Error(

@@ -97,7 +97,18 @@ export async function mergeToMp4(
 async function mergeFmp4(segmentPaths: string[], outputPath: string): Promise<void> {
   const proc = spawn(
     'ffmpeg',
-    ['-hide_banner', '-nostdin', '-y', '-i', 'pipe:0', '-c', 'copy', outputPath],
+    [
+      '-hide_banner',
+      '-nostdin',
+      '-y',
+      '-protocol_whitelist',
+      'file,pipe',
+      '-i',
+      'pipe:0',
+      '-c',
+      'copy',
+      outputPath,
+    ],
     { stdio: ['pipe', 'ignore', 'pipe'] },
   );
   activeFfmpeg = proc;
@@ -162,6 +173,8 @@ export async function muxToMp4(
     '-hide_banner',
     '-nostdin',
     '-y',
+    '-protocol_whitelist',
+    'file,pipe',
     '-i',
     videoPath,
     '-i',

@@ -349,6 +349,17 @@ segment.ts
       expect(() => parseM3U8(content)).toThrow('duplicate #EXT-X-BYTERANGE');
     });
 
+    it('rejects byte ranges whose end overflows the safe integer range', () => {
+      const content = `#EXTM3U
+#EXTINF:10,
+#EXT-X-BYTERANGE:${Number.MAX_SAFE_INTEGER}@1
+segment.ts
+#EXT-X-ENDLIST
+`;
+
+      expect(() => parseM3U8(content)).toThrow('Invalid #EXT-X-BYTERANGE value');
+    });
+
     it('rejects a trailing byte range without a segment URI', () => {
       const content = `#EXTM3U
 #EXTINF:10,
