@@ -65,6 +65,21 @@ describe('parseArgs', () => {
     );
   });
 
+  it('parses --concurrency', () => {
+    expect(parseArgs(['node', 'meow-loader', 'video.m3u8']).concurrency).toBe(1);
+    expect(parseArgs(['node', 'meow-loader', 'video.m3u8', '--concurrency', '4']).concurrency).toBe(4);
+    expect(parseArgs(['node', 'meow-loader', 'video.m3u8', '--concurrency=2']).concurrency).toBe(2);
+    expect(() => parseArgs(['node', 'meow-loader', 'video.m3u8', '--concurrency'])).toThrow(
+      '--concurrency requires a number',
+    );
+    expect(() => parseArgs(['node', 'meow-loader', 'video.m3u8', '--concurrency', '0'])).toThrow(
+      'Invalid concurrency',
+    );
+    expect(() => parseArgs(['node', 'meow-loader', 'video.m3u8', '--concurrency', '99'])).toThrow(
+      'Invalid concurrency',
+    );
+  });
+
   it('parses security and large-file options', () => {
     const args = parseArgs([
       'node',

@@ -20,7 +20,7 @@ import { formatBytes, formatDuration, sanitizeForDisplay, sanitizeMultiline } fr
 import { DiskSpaceError, DownloadLimitError, SegmentLimitError } from './src/errors';
 import { NetworkClient, readResponseText, UrlPolicyError } from './src/network';
 import { getUniqueFilePath, pickAvailableOutputPath } from './src/output-path';
-import { DownloadProgress } from './src/progress';
+import { DownloadProgress, ParallelDownloadProgress } from './src/progress';
 import { validateMp4Output } from './src/output-validation';
 import {
   cleanupResumeState,
@@ -369,11 +369,19 @@ interface DownloadTrackOptions {
   initValid: boolean;
   persist: boolean;
   budget: DownloadBudget;
+  concurrency: number;
 }
 
 interface DownloadedTrack {
   segmentPaths: string[];
   initPath?: string;
+}
+
+interface TrackProgress {
+  startSegment(index: number, expectedBytes?: number): void;
+  addBytes(bytes: number): void;
+  completeSegment(size: number): void;
+  finish(): void;
 }
 
 function trackBytes(track: ResumeTrack): number {
@@ -402,190 +410,308 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
     throw new Error('Resume metadata has no audio track');
   }
 
+  const concurrency = Math.max(1, Math.min(options.concurrency, Math.max(1, segments.length)));
   const trackWorkDir = join(workDir, kind);
   await mkdir(trackWorkDir, { recursive: true });
 
   let currentBytes = trackBytes(track);
-  const segmentPaths: string[] = [];
+  const initFileName = `${prefix}init.${container === 'fmp4' ? 'mp4' : 'ts'}`;
   let initPath: string | undefined;
 
+  // Bytes reserved by in-flight downloads, so parallel workers cannot exceed
+  // --max-download before their sizes are known.
+  let reservedBytes = 0;
+  const reserveBytes = (): number => {
+    const remaining =
+      budget.maxBytes > 0 ? budget.maxBytes - budget.usedBytes - reservedBytes : Infinity;
+    if (remaining <= 0) {
+      throw new DownloadLimitError(
+        `Download limit reached (${formatBytes(budget.maxBytes)}). Resume later with: --resume ${tmpDir} --max-download ${formatBytes(budget.maxBytes * 2)}`,
+      );
+    }
+
+    const slice = Math.min(budget.maxSegmentBytes, remaining);
+    reservedBytes += slice;
+    return slice;
+  };
+
+  const settleBytes = (slice: number, actualBytes: number): void => {
+    reservedBytes -= slice;
+    budget.usedBytes += actualBytes;
+  };
+
+  const releaseBytes = (slice: number): void => {
+    reservedBytes -= slice;
+  };
+
+  let saveChain: Promise<void> = Promise.resolve();
+  let saveError: unknown;
+  const persist = async (): Promise<void> => {
+    saveChain = saveChain.then(async () => {
+      if (saveError) return;
+      try {
+        await saveResumeMetadata(tmpDir, options.metadata, trackWorkDir);
+      } catch (error) {
+        saveError = error;
+        throw error;
+      }
+    });
+    await saveChain;
+  };
+
+  let aborted = false;
+  const abortController = new AbortController();
+  const fail = (error: unknown, printError = true): void => {
+    if (aborted) return;
+    aborted = true;
+    abortController.abort();
+    if (printError) {
+      console.error(`\n${errorMessage(error)}`);
+    }
+    console.log(`Resume later with: --resume ${tmpDir}`);
+    process.exitCode = 1;
+  };
+
   if (map) {
-    const fileName = `${prefix}init.${container === 'fmp4' ? 'mp4' : 'ts'}`;
-    initPath = join(tmpDir, fileName);
+    initPath = join(tmpDir, initFileName);
 
     if (!options.initValid || !track.initSegment) {
-      if (budget.maxBytes > 0 && budget.usedBytes >= budget.maxBytes) {
-        throw new DownloadLimitError(
-          `Download limit reached (${formatBytes(budget.maxBytes)}). Resume later with: --resume ${tmpDir} --max-download ${formatBytes(budget.maxBytes * 2)}`,
-        );
+      let slice: number;
+      try {
+        slice = reserveBytes();
+      } catch (error) {
+        fail(error);
+        return null;
       }
 
-      const remaining = budget.maxBytes > 0 ? budget.maxBytes - budget.usedBytes : Infinity;
-      const maxBytes = Math.min(budget.maxSegmentBytes, remaining);
-
       console.log(`Downloading ${kindLabel}initialization segment...`);
+      let settled = false;
       try {
-        const partialPath = join(trackWorkDir, `${fileName}.part`);
+        const partialPath = join(trackWorkDir, `${initFileName}.part`);
         const result = await downloadInitSegmentToFile(map, playlistUrl, partialPath, {
           network,
           keyCache,
-          maxBytes,
+          maxBytes: slice,
           container: 'fmp4',
+          signal: abortController.signal,
         });
 
         await replaceSegmentFile(partialPath, initPath);
+        settleBytes(slice, result.size);
+        settled = true;
 
         if (options.persist) {
           if (kind === 'audio') {
-            recordAudioInitSegment(options.metadata, fileName, result.size, result.sha256);
+            recordAudioInitSegment(options.metadata, initFileName, result.size, result.sha256);
           } else {
-            recordInitSegment(options.metadata, fileName, result.size, result.sha256);
+            recordInitSegment(options.metadata, initFileName, result.size, result.sha256);
           }
-          await saveResumeMetadata(tmpDir, options.metadata, trackWorkDir);
+          await persist();
         }
 
         currentBytes += result.size;
-        budget.usedBytes += result.size;
       } catch (error) {
-        console.error(`\nFailed to download the ${kindLabel}initialization segment.`);
-        console.error(errorMessage(error));
-        console.log(`Resume later with: --resume ${tmpDir}`);
-        process.exitCode = 1;
+        if (!settled) {
+          releaseBytes(slice);
+        }
+        fail(saveError ?? error);
         return null;
       }
     }
   }
 
-  const progress = new DownloadProgress(
-    segments.length,
-    currentBytes,
-    options.completed.size,
-    Boolean(stdin.isTTY),
-    kind === 'audio' ? 'Audio ' : '',
-  );
+  const progress: TrackProgress =
+    concurrency > 1
+      ? new ParallelDownloadProgress(
+          segments.length,
+          currentBytes,
+          options.completed.size,
+          Boolean(stdin.isTTY),
+          kind === 'audio' ? 'Audio ' : '',
+        )
+      : new DownloadProgress(
+          segments.length,
+          currentBytes,
+          options.completed.size,
+          Boolean(stdin.isTTY),
+          kind === 'audio' ? 'Audio ' : '',
+        );
 
   console.log(
     kind === 'audio'
       ? `Downloading audio: ${segments.length} segments...`
       : `Downloading ${segments.length} segments...`,
   );
+  if (concurrency > 1) {
+    console.log(`Using up to ${concurrency} parallel segment downloads.`);
+  }
 
-  try {
-    for (let index = 0; index < segments.length; index++) {
-      const segment = segments[index]!;
-      const fileName = `${prefix}segment_${String(index).padStart(String(segments.length).length, '0')}.${extension}`;
-      const segmentPath = join(tmpDir, fileName);
+  const pendingIndices: number[] = [];
+  for (let index = 0; index < segments.length; index++) {
+    if (!options.completed.has(index)) {
+      pendingIndices.push(index);
+    }
+  }
+  let cursor = 0;
 
-      if (options.completed.has(index)) {
-        segmentPaths.push(segmentPath);
-        continue;
-      }
+  const downloadOne = async (index: number): Promise<void> => {
+    if (aborted) return;
 
-      if (budget.maxBytes > 0 && budget.usedBytes >= budget.maxBytes) {
-        throw new DownloadLimitError(
-          `Download limit reached (${formatBytes(budget.maxBytes)}). Resume later with: --resume ${tmpDir} --max-download ${formatBytes(budget.maxBytes * 2)}`,
-        );
-      }
+    const segment = segments[index]!;
+    const fileName = `${prefix}segment_${String(index).padStart(String(segments.length).length, '0')}.${extension}`;
+    const segmentPath = join(tmpDir, fileName);
 
-      const remaining = budget.maxBytes > 0 ? budget.maxBytes - budget.usedBytes : Infinity;
-      const maxBytes = Math.min(budget.maxSegmentBytes, remaining);
-
+    if (index === 0 || index % 10 === 0) {
       try {
-        if (index === 0 || index % 10 === 0) {
-          await ensureFreeSpace(
-            tmpDir,
-            Math.min(
-              budget.maxSegmentBytes,
-              Number.isFinite(maxBytes) ? maxBytes : budget.maxSegmentBytes,
-            ) + FREE_SPACE_MARGIN,
-            'download',
-          );
-        }
+        await ensureFreeSpace(tmpDir, budget.maxSegmentBytes + FREE_SPACE_MARGIN, 'download');
       } catch (error) {
-        console.error(`\n${errorMessage(error)}`);
-        console.log(`Resume later with: --resume ${tmpDir}`);
-        process.exitCode = 1;
-        return null;
+        fail(error);
+        return;
+      }
+    }
+
+    progress.startSegment(index, segment.byterange?.length);
+    let attempts = 0;
+
+    while (!aborted) {
+      let slice: number;
+      try {
+        slice = reserveBytes();
+      } catch (error) {
+        fail(error);
+        return;
       }
 
-      progress.startSegment(index, segment.byterange?.length);
-      let attempts = 0;
-      let downloaded = false;
-
-      while (!downloaded) {
-        try {
-          const partialPath = join(trackWorkDir, `${fileName}.part`);
-          const result = await downloadSegmentToFile(segment, playlistUrl, partialPath, {
-            network,
-            keyCache,
-            maxBytes,
-            container,
-            onProgress: bytes => progress.addBytes(bytes),
-          });
-
-          await replaceSegmentFile(partialPath, segmentPath);
-
-          if (options.persist) {
-            if (kind === 'audio') {
-              recordAudioSegment(options.metadata, index, fileName, result.size, result.sha256);
+      let settled = false;
+      try {
+        const partialPath = join(trackWorkDir, `${fileName}.${attempts}.part`);
+        let lastBytes = 0;
+        const result = await downloadSegmentToFile(segment, playlistUrl, partialPath, {
+          network,
+          keyCache,
+          maxBytes: slice,
+          container,
+          signal: abortController.signal,
+          onProgress: bytes => {
+            if (concurrency > 1) {
+              progress.addBytes(bytes - lastBytes);
+              lastBytes = bytes;
             } else {
-              recordSegment(options.metadata, index, fileName, result.size, result.sha256);
+              progress.addBytes(bytes);
             }
-            await saveResumeMetadata(tmpDir, options.metadata, trackWorkDir);
-          }
+          },
+        });
 
-          segmentPaths.push(segmentPath);
-          currentBytes += result.size;
-          budget.usedBytes += result.size;
-          progress.completeSegment(result.size);
-          downloaded = true;
-        } catch (error) {
-          if (
-            error instanceof SegmentLimitError ||
-            error instanceof DownloadLimitError ||
-            error instanceof DiskSpaceError ||
-            error instanceof UrlPolicyError
-          ) {
-            console.error(`\n${errorMessage(error)}`);
-            console.log(`Resume later with: --resume ${tmpDir}`);
-            process.exitCode = 1;
-            return null;
-          }
+        await replaceSegmentFile(partialPath, segmentPath);
+        settleBytes(slice, result.size);
+        settled = true;
 
-          attempts++;
-          console.error(`\nFailed to download ${kindLabel}segment ${index + 1}`);
-          console.error(errorMessage(error));
-
-          if (attempts >= MAX_ATTEMPTS) {
-            console.error(`Max retries reached for ${kindLabel}segment ${index + 1}.`);
-            console.log(`Resume later with: --resume ${tmpDir}`);
-            process.exitCode = 1;
-            return null;
-          }
-
-          if (stdin.isTTY) {
-            const action = await promptRetry(attempts);
-            if (action === 'save') {
-              console.log(`Partial download saved. Resume later with: --resume ${tmpDir}`);
-              process.exitCode = 1;
-              return null;
-            }
+        if (options.persist) {
+          if (kind === 'audio') {
+            recordAudioSegment(options.metadata, index, fileName, result.size, result.sha256);
           } else {
-            const wait = 500 * 2 ** (attempts - 1);
-            console.error(`Retrying in ${wait}ms...`);
-            await delay(wait);
+            recordSegment(options.metadata, index, fileName, result.size, result.sha256);
           }
+
+          try {
+            await persist();
+          } catch (error) {
+            fail(saveError ?? error);
+            return;
+          }
+        }
+
+        currentBytes += result.size;
+        progress.completeSegment(result.size);
+        return;
+      } catch (error) {
+        if (!settled) {
+          releaseBytes(slice);
+        }
+
+        if (aborted) {
+          return;
+        }
+        if (saveError) {
+          fail(saveError);
+          return;
+        }
+        if (
+          error instanceof SegmentLimitError ||
+          error instanceof DownloadLimitError ||
+          error instanceof DiskSpaceError ||
+          error instanceof UrlPolicyError
+        ) {
+          fail(error);
+          return;
+        }
+
+        attempts++;
+        console.error(`\nFailed to download ${kindLabel}segment ${index + 1}`);
+        console.error(errorMessage(error));
+
+        if (attempts >= MAX_ATTEMPTS) {
+          console.error(`Max retries reached for ${kindLabel}segment ${index + 1}.`);
+          fail(null, false);
+          return;
+        }
+
+        if (concurrency === 1 && stdin.isTTY) {
+          const action = await promptRetry(attempts);
+          if (action === 'save') {
+            console.log(`Partial download saved. Resume later with: --resume ${tmpDir}`);
+            process.exitCode = 1;
+            aborted = true;
+            abortController.abort();
+            return;
+          }
+        } else {
+          const wait = 500 * 2 ** (attempts - 1);
+          console.error(`Retrying in ${wait}ms...`);
+          await delay(wait);
         }
       }
     }
+  };
+
+  try {
+    if (pendingIndices.length > 0) {
+      const workerCount = Math.min(concurrency, pendingIndices.length);
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (!aborted) {
+          const index = pendingIndices[cursor++];
+          if (index === undefined) {
+            return;
+          }
+          await downloadOne(index);
+        }
+      });
+
+      await Promise.all(workers);
+    }
+
+    await saveChain;
+    if (saveError) {
+      fail(saveError, false);
+      return null;
+    }
+    if (aborted) {
+      return null;
+    }
+
+    const segmentPaths = segments.map((_, index) =>
+      join(
+        tmpDir,
+        `${prefix}segment_${String(index).padStart(String(segments.length).length, '0')}.${extension}`,
+      ),
+    );
 
     return { segmentPaths, ...(initPath ? { initPath } : {}) };
   } finally {
     progress.finish();
     await rm(trackWorkDir, { recursive: true, force: true }).catch(() => {});
   }
-}
-async function replaceFile(source: string, target: string): Promise<void> {
+}async function replaceFile(source: string, target: string): Promise<void> {
   try {
     await rename(source, target);
     return;
@@ -1099,6 +1225,7 @@ async function main(): Promise<void> {
     initValid: resume.initValid,
     persist: true,
     budget,
+    concurrency: args.concurrency,
   });
   if (!videoResult) {
     return;
@@ -1125,6 +1252,7 @@ async function main(): Promise<void> {
       initValid: resume.audio.initValid,
       persist: true,
       budget,
+      concurrency: args.concurrency,
     });
     if (!result) {
       return;

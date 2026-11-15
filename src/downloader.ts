@@ -20,6 +20,7 @@ export interface DownloadSegmentOptions {
   keyCache: Map<string, Buffer>;
   maxBytes: number;
   container: HlsContainer;
+  signal?: AbortSignal;
   onProgress?: (bytes: number) => void;
 }
 
@@ -97,6 +98,9 @@ async function downloadFile(
   const rangeHeader = byterange
     ? `bytes=${byterange.offset}-${byterange.offset + byterange.length - 1}`
     : undefined;
+  const signal = options.signal
+    ? AbortSignal.any([controller.signal, options.signal])
+    : controller.signal;
 
   let response: Response;
   try {
@@ -105,7 +109,7 @@ async function downloadFile(
       rangeHeader ? { headers: { Range: rangeHeader } } : {},
       {
         label: spec.label,
-        signal: controller.signal,
+        signal,
         timeoutMs: 0,
       },
     );

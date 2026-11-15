@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DownloadProgress } from '../src/progress';
+import { DownloadProgress, ParallelDownloadProgress } from '../src/progress';
 
 function captureStdout(): string[] {
   const writes: string[] = [];
@@ -32,6 +32,21 @@ describe('DownloadProgress', () => {
     progress.startSegment(0);
 
     expect(writes[0]).toContain('Audio Segment 1/1');
+  });
+
+  it('renders parallel progress with active counts', () => {
+    const writes = captureStdout();
+
+    const progress = new ParallelDownloadProgress(3, 0, 0, true, 'Audio ');
+    progress.startSegment(0);
+    progress.startSegment(1);
+
+    expect(writes.at(-1)).toContain('Audio Segments 0/3');
+    expect(writes.at(-1)).toContain('2 active');
+
+    progress.completeSegment(1000);
+    expect(writes.at(-1)).toContain('Audio Segments 1/3');
+    expect(writes.at(-1)).toContain('1 active');
   });
 
   it('does not write escape sequences when not attached to a TTY', () => {

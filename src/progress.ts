@@ -130,3 +130,123 @@ export class DownloadProgress {
     this.lastSampleBytes = currentBytes;
   }
 }
+
+/**
+ * Progress display for parallel downloads. Bytes are aggregated across all
+ * active segments and the line shows completed and in-flight counts instead
+ * of a single segment index.
+ */
+export class ParallelDownloadProgress {
+  private readonly tty: boolean;
+  private readonly totalSegments: number;
+  private readonly label: string;
+  private completedSegments: number;
+  private activeSegments = 0;
+  private bytes: number;
+  private lastRenderAt = 0;
+  private lastLogAt = 0;
+  private lastSampleAt = Date.now();
+  private lastSampleBytes: number;
+  private speedBytesPerSecond = 0;
+  private warnedLarge = false;
+  private hasRendered = false;
+
+  constructor(
+    totalSegments: number,
+    initialBytes: number,
+    initialCompleted: number,
+    tty: boolean,
+    label = '',
+  ) {
+    this.totalSegments = totalSegments;
+    this.label = label;
+    this.bytes = initialBytes;
+    this.completedSegments = initialCompleted;
+    this.lastSampleBytes = initialBytes;
+    this.tty = tty;
+  }
+
+  startSegment(_index: number, _expectedBytes?: number): void {
+    this.activeSegments++;
+    this.render(false);
+  }
+
+  addBytes(bytes: number): void {
+    this.bytes += bytes;
+    const now = Date.now();
+    if (now - this.lastRenderAt >= 250) {
+      this.render(false);
+    }
+  }
+
+  completeSegment(_size: number): void {
+    this.activeSegments = Math.max(0, this.activeSegments - 1);
+    this.completedSegments++;
+    this.render(false);
+  }
+
+  finish(): void {
+    if (this.tty && this.hasRendered) {
+      process.stdout.write('\n');
+    }
+  }
+
+  private render(final: boolean): void {
+    const now = Date.now();
+    this.updateSpeed(now);
+
+    if (!this.warnedLarge && this.bytes >= LARGE_DOWNLOAD_WARNING_BYTES) {
+      this.warnedLarge = true;
+      console.error(
+        `Warning: downloaded ${formatBytes(this.bytes)}. Use --max-download to set a hard limit.`,
+      );
+    }
+
+    const parts = [
+      `${this.label}Segments ${this.completedSegments}/${this.totalSegments}`,
+      this.activeSegments > 0 ? `${this.activeSegments} active` : 'finishing',
+      `total ${formatBytes(this.bytes)}`,
+    ];
+
+    if (this.speedBytesPerSecond > 0) {
+      parts.push(`${formatBytes(this.speedBytesPerSecond)}/s`);
+    }
+
+    const averageBytes =
+      this.completedSegments > 0 ? this.bytes / this.completedSegments : undefined;
+    const remainingSegments = Math.max(0, this.totalSegments - this.completedSegments);
+    if (averageBytes !== undefined && this.speedBytesPerSecond > 0) {
+      parts.push(`ETA ${formatEta((averageBytes * remainingSegments) / this.speedBytesPerSecond)}`);
+    }
+
+    const line = parts.join(' · ');
+
+    if (this.tty) {
+      process.stdout.write(`\r${line}\x1b[K`);
+      this.hasRendered = true;
+    } else if (final) {
+      const shouldLog =
+        this.totalSegments <= 10 ||
+        this.completedSegments % 10 === 0 ||
+        this.completedSegments === this.totalSegments ||
+        now - this.lastLogAt >= 5_000;
+
+      if (shouldLog) {
+        console.log(line);
+        this.lastLogAt = now;
+      }
+    }
+
+    this.lastRenderAt = now;
+  }
+
+  private updateSpeed(now: number): void {
+    const elapsed = now - this.lastSampleAt;
+    if (elapsed < 500) return;
+
+    const deltaBytes = this.bytes - this.lastSampleBytes;
+    this.speedBytesPerSecond = (deltaBytes * 1000) / elapsed;
+    this.lastSampleAt = now;
+    this.lastSampleBytes = this.bytes;
+  }
+}

@@ -9,6 +9,8 @@ export const DEFAULT_MAX_DOWNLOAD = 50 * 1024 ** 3;
 export const DEFAULT_MAX_SEGMENT_SIZE = 1024 ** 3;
 export const DEFAULT_PLAYLIST_MAX_BYTES = 16 * 1024 ** 2;
 export const DEFAULT_MAX_SEGMENTS = 100_000;
+export const DEFAULT_CONCURRENCY = 1;
+export const MAX_CONCURRENCY = 16;
 
 export interface ParsedArgs {
   headers: Record<string, string>;
@@ -24,6 +26,7 @@ export interface ParsedArgs {
   dryRun: boolean;
   maxDownload: number;
   maxSegmentSize: number;
+  concurrency: number;
   help: boolean;
   version: boolean;
 }
@@ -40,6 +43,7 @@ Options:
   --cleanup                       Remove downloaded segments from the --resume/--merge-only dir after success
   --max-download <size>           Maximum total download, e.g. 50GB (0 = unlimited)
   --max-segment-size <size>       Maximum size of one segment, e.g. 1GB
+  --concurrency <n>               Download up to n segments in parallel (default: 1)
   --allow-private-network         Allow loopback/private-network URLs in manifests
   --allow-insecure                Allow HTTPS playlists to reference HTTP resources
   --dry-run                       Show playlist information without downloading
@@ -143,6 +147,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   let dryRun = false;
   let maxDownload = DEFAULT_MAX_DOWNLOAD;
   let maxSegmentSize = DEFAULT_MAX_SEGMENT_SIZE;
+  let concurrency = DEFAULT_CONCURRENCY;
   let help = false;
   let version = false;
   let endOfOptions = false;
@@ -342,6 +347,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
       continue;
     }
 
+    const concurrencyOption = takeValue(argv, i, '--concurrency');
+    if (concurrencyOption) {
+      if (concurrencyOption.value === undefined) {
+        throw new Error('--concurrency requires a number');
+      }
+      i = concurrencyOption.next;
+      concurrency = parseConcurrency(concurrencyOption.value);
+      continue;
+    }
+
     if (!endOfOptions && arg.startsWith('-') && arg !== '-') {
       if (curl) {
         throw new Error(
@@ -374,6 +389,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     dryRun,
     maxDownload,
     maxSegmentSize,
+    concurrency,
     help,
     version,
   };
@@ -408,6 +424,19 @@ function resolveCurlPositionals(
   const variant = curlOutput !== undefined ? rest[0] : rest[1];
 
   return [url, output, variant].filter((value): value is string => value !== undefined);
+}
+
+export function parseConcurrency(value: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invalid concurrency "${value}". Choose 1-${MAX_CONCURRENCY}`);
+  }
+
+  const concurrency = Number(value);
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
+    throw new Error(`Invalid concurrency. Choose 1-${MAX_CONCURRENCY}`);
+  }
+
+  return concurrency;
 }
 
 export function parseByteSize(value: string): number {

@@ -52,6 +52,9 @@ npx meow-loader https://example.com/master.m3u8 my-video.mp4 0 --audio 1
 # Inspect variants, duration, and estimated size without downloading
 npx meow-loader https://example.com/master.m3u8 --dry-run
 
+# Download up to 3 segments at once
+npx meow-loader https://example.com/stream.m3u8 --concurrency 3
+
 # Keep partial downloads and resume later
 npx meow-loader https://example.com/stream.m3u8 --resume /tmp/meow-abc123
 
@@ -179,6 +182,21 @@ If a limit is reached:
 
 `--dry-run` prints the selected variant, segment count, duration, estimated size, and free space without downloading.
 
+### Concurrency
+
+Segment downloads are sequential by default. `--concurrency <n>` downloads up
+to `n` segments at once, from 1 to 16:
+
+```bash
+npx meow-loader https://example.com/stream.m3u8 --concurrency 4
+```
+
+`--max-download` and `--max-segment-size` are shared across in-flight requests.
+The remaining budget is reserved per worker, so a tight limit can stop new
+workers before they start. In parallel mode retries use automatic backoff
+instead of the interactive retry prompt. Concurrency applies per track: the
+video track is downloaded first, then a separate audio track.
+
 ### Output safety
 
 - With no output filename, an existing `output.mp4` is never overwritten;
@@ -285,6 +303,7 @@ playlists require a server or CDN that honors `Range` requests.
 - Segment container validation and ffprobe duration verification before replacing output
 - Resume interrupted downloads without treating partial files as complete
 - Merge segments into a single MP4 via ffmpeg
+- Optional parallel segment downloads with shared limits (`--concurrency`)
 - Per-origin header scoping, SSRF protection, and request timeouts
 
 ## Limitations

@@ -75,6 +75,17 @@ av-video.m3u8
 
 const audioMasterLowBandwidth = audioMasterPlaylist.replace('BANDWIDTH=2000000', 'BANDWIDTH=1000');
 
+const slowPlaylist = `#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+slow/segments/0.ts
+#EXTINF:10,
+slow/segments/1.ts
+#EXTINF:10,
+slow/segments/2.ts
+#EXT-X-ENDLIST
+`;
+
 async function ffprobeStreamTypes(filePath: string): Promise<string[]> {
   const { stdout } = await execFileAsync('ffprobe', [
     '-v',
@@ -182,6 +193,8 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
   let segmentGate: { path: string; started: () => void; released: Promise<void> } | undefined;
   let rangeRequests: string[] = [];
   let audioRequests: string[] = [];
+  let slowInFlight = 0;
+  let slowMaxConcurrent = 0;
   let byteRangePlaylist: string;
   let fmp4RangePlaylist: string;
   let tsRangeBody: Buffer;
@@ -311,6 +324,28 @@ media/all.mp4
         } catch {
           response.writeHead(404);
           response.end('not found');
+        }
+        return;
+      }
+
+      if (pathname === '/slow.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(slowPlaylist);
+        return;
+      }
+
+      if (pathname.startsWith('/slow/segments/')) {
+        slowInFlight++;
+        slowMaxConcurrent = Math.max(slowMaxConcurrent, slowInFlight);
+        try {
+          await new Promise(resolve => setTimeout(resolve, 150));
+          const index = Number(pathname.split('/').pop()!.replace('.ts', ''));
+          const names = ['segment_000_red.ts', 'segment_001_blue.ts', 'segment_002_green.ts'];
+          const content = await readFile(join(fixtures, 'segments', names[index]!));
+          response.writeHead(200, { 'content-type': 'video/mp2t' });
+          response.end(content);
+        } finally {
+          slowInFlight--;
         }
         return;
       }
@@ -1041,6 +1076,48 @@ media/all.mp4
 
     expect(error.code).toBe(1);
     expect(error.stderr).toMatch(/limit/i);
+  });
+
+  it('downloads segments sequentially by default', async () => {
+    slowMaxConcurrent = 0;
+    slowInFlight = 0;
+    const output = join(tempRoot, 'sequential.mp4');
+    const { stdout } = await command([`${baseUrl}/slow.m3u8`, output]);
+
+    expect(stdout).not.toContain('parallel segment downloads');
+    expect(slowMaxConcurrent).toBe(1);
+    expect(stdout).toContain('Done! Saved to');
+  });
+
+  it('downloads segments in parallel with --concurrency', async () => {
+    slowMaxConcurrent = 0;
+    slowInFlight = 0;
+    const output = join(tempRoot, 'concurrent.mp4');
+    const { stdout } = await command([
+      `${baseUrl}/slow.m3u8`,
+      output,
+      '--concurrency',
+      '3',
+    ]);
+
+    expect(stdout).toContain('Using up to 3 parallel segment downloads');
+    expect(slowMaxConcurrent).toBeGreaterThan(1);
+    expect(slowMaxConcurrent).toBeLessThanOrEqual(3);
+    expect(stdout).toContain('Done! Saved to');
+  });
+
+  it('keeps parallel downloads within --max-download', async () => {
+    const error = await command([
+      `${baseUrl}/slow.m3u8`,
+      join(tempRoot, 'parallel-limit.mp4'),
+      '--concurrency',
+      '3',
+      '--max-download',
+      '150KB',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('Download limit reached');
   });
 
   it('resumes separate audio segments', async () => {
