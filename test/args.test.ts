@@ -57,6 +57,14 @@ describe('parseArgs', () => {
     );
   });
 
+  it('parses --audio', () => {
+    expect(parseArgs(['node', 'meow-loader', 'master.m3u8', '--audio', '1']).audio).toBe('1');
+    expect(parseArgs(['node', 'meow-loader', 'master.m3u8', '--audio=2']).audio).toBe('2');
+    expect(() => parseArgs(['node', 'meow-loader', 'master.m3u8', '--audio'])).toThrow(
+      '--audio requires a rendition index',
+    );
+  });
+
   it('parses security and large-file options', () => {
     const args = parseArgs([
       'node',

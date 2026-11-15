@@ -16,6 +16,7 @@ export interface ParsedArgs {
   positionals: string[];
   resumeDir: string | undefined;
   mergeDir: string | undefined;
+  audio: string | undefined;
   force: boolean;
   cleanup: boolean;
   allowPrivateNetwork: boolean;
@@ -33,6 +34,7 @@ export const USAGE = `Usage: meow-loader <m3u8-url> [output.mp4] [variant-index]
 Options:
   -H, --header <"Key: Value">    Add a custom HTTP header (repeatable)
   --header-origin <origin>        Send custom headers to this origin too (repeatable)
+  --audio <index>                 Select an audio rendition (master playlists)
   --resume <dir>                  Resume a partial download from a saved working dir
   --merge-only <dir>              Merge a saved working dir without fetching the playlist
   --cleanup                       Remove downloaded segments from the --resume/--merge-only dir after success
@@ -60,6 +62,7 @@ Examples:
   meow-loader https://example.com/video.m3u8 --header "Authorization: Bearer token" \\
     --header-origin https://cdn.example.com
   meow-loader curl 'https://example.com/video.m3u8' -b 'session=abc123'
+  meow-loader https://example.com/master.m3u8 out.mp4 0 --audio 1
   meow-loader https://example.com/video.m3u8 --resume /tmp/meow-abc123
   meow-loader --merge-only /tmp/meow-abc123 saved.mp4
   meow-loader https://example.com/video.m3u8 --dry-run`;
@@ -132,6 +135,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
   let resumeDir: string | undefined;
   let mergeDir: string | undefined;
+  let audio: string | undefined;
   let force = false;
   let cleanup = false;
   let allowPrivateNetwork = false;
@@ -288,6 +292,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
       continue;
     }
 
+    const audioOption = takeValue(argv, i, '--audio');
+    if (audioOption) {
+      if (audioOption.value === undefined) {
+        throw new Error('--audio requires a rendition index');
+      }
+      i = audioOption.next;
+      audio = audioOption.value;
+      continue;
+    }
+
     const mergeOption = takeValue(argv, i, '--merge-only');
     if (mergeOption) {
       if (mergeOption.value === undefined) {
@@ -352,6 +366,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     positionals: curl ? resolveCurlPositionals(positionals, curlUrl, curlOutput) : positionals,
     resumeDir,
     mergeDir,
+    audio,
     force,
     cleanup,
     allowPrivateNetwork,

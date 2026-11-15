@@ -311,6 +311,27 @@ export function sortVariantsByBandwidth(variants: M3U8Variant[]): M3U8Variant[] 
 }
 
 /**
+ * Audio renditions that have their own playlist, ordered for display and
+ * selection: DEFAULT first, then AUTOSELECT, then playlist order.
+ */
+export function sortAudioRenditions(
+  media: M3U8Media[] | undefined,
+  groupId: string | undefined,
+): M3U8Media[] {
+  if (!groupId || !media) {
+    return [];
+  }
+
+  const rank = (entry: M3U8Media): number => (entry.default ? 0 : entry.autoselect ? 1 : 2);
+
+  return media
+    .filter(entry => entry.type === 'AUDIO' && entry.groupId === groupId && entry.uri)
+    .map((entry, index) => ({ entry, index }))
+    .sort((a, b) => rank(a.entry) - rank(b.entry) || a.index - b.index)
+    .map(item => item.entry);
+}
+
+/**
  * Pick the audio rendition referenced by a variant's AUDIO group. Prefers the
  * DEFAULT rendition, then AUTOSELECT, then the first entry that has a URI.
  * Returns undefined when the audio is muxed into the variant.
@@ -319,22 +340,7 @@ export function selectAudioRendition(
   media: M3U8Media[] | undefined,
   groupId: string | undefined,
 ): M3U8Media | undefined {
-  if (!groupId || !media) {
-    return undefined;
-  }
-
-  const candidates = media.filter(
-    entry => entry.type === 'AUDIO' && entry.groupId === groupId && entry.uri,
-  );
-  if (candidates.length === 0) {
-    return undefined;
-  }
-
-  return (
-    candidates.find(entry => entry.default) ??
-    candidates.find(entry => entry.autoselect) ??
-    candidates[0]
-  );
+  return sortAudioRenditions(media, groupId)[0];
 }
 
 function isSupportedKeyUri(uri: string): boolean {

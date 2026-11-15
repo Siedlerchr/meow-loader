@@ -67,8 +67,8 @@ media/all-short.ts
 `;
 
 const audioMasterPlaylist = `#EXTM3U
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"
-#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Spanish",LANGUAGE="es",DEFAULT=NO,AUTOSELECT=YES,URI="audio/playlist.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8?lang=en"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Spanish",LANGUAGE="es",DEFAULT=NO,AUTOSELECT=YES,URI="audio/playlist.m3u8?lang=es"
 #EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,AUDIO="aud"
 av-video.m3u8
 `;
@@ -181,6 +181,7 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
   let segmentRequests: string[] = [];
   let segmentGate: { path: string; started: () => void; released: Promise<void> } | undefined;
   let rangeRequests: string[] = [];
+  let audioRequests: string[] = [];
   let byteRangePlaylist: string;
   let fmp4RangePlaylist: string;
   let tsRangeBody: Buffer;
@@ -297,6 +298,7 @@ media/all.mp4
       }
 
       if (pathname.startsWith('/audio/')) {
+        audioRequests.push(request.url || pathname);
         const fileName = pathname.split('/').pop()!;
         try {
           const content = await readFile(join(fixtures, 'audio', fileName));
@@ -965,6 +967,7 @@ media/all.mp4
   });
 
   it('downloads a separate audio rendition and muxes it', async () => {
+    audioRequests = [];
     const info = await command([`${baseUrl}/av-master.m3u8`, '--dry-run']);
     expect(info.stdout).toContain('Audio segments: 3');
     expect(info.stdout).toContain('Audio container: MPEG-TS');
@@ -972,14 +975,60 @@ media/all.mp4
     const output = join(tempRoot, 'av.mp4');
     const { stdout } = await command([`${baseUrl}/av-master.m3u8`, output]);
 
+    expect(stdout).toContain('Available audio renditions:');
     expect(stdout).toContain('Audio rendition: English (en)');
     expect(stdout).toContain('Fetching audio playlist');
     expect(stdout).toContain('Downloading audio: 3 segments');
     expect(stdout).toContain('Done! Saved to');
+    expect(audioRequests.some(url => url.includes('?lang=en'))).toBe(true);
 
     const streams = await ffprobeStreamTypes(output);
     expect(streams).toContain('video');
     expect(streams).toContain('audio');
+  });
+
+  it('selects an audio rendition by index', async () => {
+    audioRequests = [];
+    const output = join(tempRoot, 'av-spanish.mp4');
+    const { stdout } = await command([
+      `${baseUrl}/av-master.m3u8`,
+      output,
+      '--audio',
+      '1',
+    ]);
+
+    expect(stdout).toContain('[0] English (en, default)');
+    expect(stdout).toContain('[1] Spanish (es)');
+    expect(stdout).toContain('Audio rendition: Spanish (es)');
+    expect(audioRequests.some(url => url.includes('?lang=es'))).toBe(true);
+    expect(audioRequests.some(url => url.includes('?lang=en'))).toBe(false);
+
+    const streams = await ffprobeStreamTypes(output);
+    expect(streams).toContain('audio');
+  });
+
+  it('rejects an out-of-range audio index', async () => {
+    const error = await command([
+      `${baseUrl}/av-master.m3u8`,
+      join(tempRoot, 'av-bad-audio.mp4'),
+      '--audio',
+      '9',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('Invalid audio index. Choose 0-1');
+  });
+
+  it('rejects --audio without a master playlist', async () => {
+    const error = await command([
+      `${baseUrl}/media.m3u8`,
+      join(tempRoot, 'audio-flag.mp4'),
+      '--audio',
+      '0',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('--audio can only be used with a master playlist');
   });
 
   it('applies --max-download across video and audio', async () => {

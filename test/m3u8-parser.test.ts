@@ -2,7 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseM3U8, selectAudioRendition, sortVariantsByBandwidth } from '../src/m3u8-parser';
+import {
+  parseM3U8,
+  selectAudioRendition,
+  sortAudioRenditions,
+  sortVariantsByBandwidth,
+} from '../src/m3u8-parser';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const fixturesDir = join(__dirname, 'fixtures');
@@ -423,6 +428,22 @@ video.m3u8
 `);
 
       expect(selectAudioRendition(playlist.media, 'aud')?.name).toBe('Main');
+    });
+
+    it('orders renditions with DEFAULT first, then AUTOSELECT', () => {
+      const playlist = parseM3U8(`#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Commentary",DEFAULT=NO,AUTOSELECT=NO,URI="audio/commentary.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Main",DEFAULT=YES,AUTOSELECT=YES,URI="audio/main.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Secondary",DEFAULT=NO,AUTOSELECT=YES,URI="audio/secondary.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"
+video.m3u8
+`);
+
+      expect(sortAudioRenditions(playlist.media, 'aud').map(entry => entry.name)).toEqual([
+        'Main',
+        'Secondary',
+        'Commentary',
+      ]);
     });
 
     it('returns undefined when the group has no URI-bearing renditions', () => {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { parseM3U8, selectAudioRendition, sortVariantsByBandwidth } from './src/m3u8-parser';
+import { parseM3U8, sortAudioRenditions, sortVariantsByBandwidth } from './src/m3u8-parser';
 import type {
   M3U8Map,
   M3U8Media,
@@ -88,6 +88,19 @@ function parseVariantIndex(value: string, count: number): number {
   return index;
 }
 
+function parseAudioIndex(value: string, count: number): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invalid audio index "${sanitizeForDisplay(value, 40)}". Choose 0-${count - 1}`);
+  }
+
+  const index = Number(value);
+  if (!Number.isInteger(index) || index < 0 || index >= count) {
+    throw new Error(`Invalid audio index. Choose 0-${count - 1}`);
+  }
+
+  return index;
+}
+
 async function selectVariant(variants: M3U8Variant[], variantArg: string | undefined): Promise<M3U8Variant> {
   const sorted = sortVariantsByBandwidth(variants);
 
@@ -116,6 +129,58 @@ async function selectVariant(variants: M3U8Variant[], variantArg: string | undef
     const input = await rl.question(`Select variant (0-${sorted.length - 1}, default: 0 highest): `);
     const trimmed = input.trim();
     return trimmed ? sorted[parseVariantIndex(trimmed, sorted.length)]! : sorted[0]!;
+  } finally {
+    rl.close();
+  }
+}
+
+async function selectAudioRenditionForGroup(
+  media: M3U8Media[] | undefined,
+  groupId: string,
+  audioArg: string | undefined,
+): Promise<M3U8Media | undefined> {
+  const candidates = sortAudioRenditions(media, groupId);
+
+  if (candidates.length === 0) {
+    if (audioArg !== undefined) {
+      throw new Error('--audio cannot be used: the selected variant has no separate audio rendition');
+    }
+    return undefined;
+  }
+
+  if (candidates.length > 1) {
+    console.log('Available audio renditions:');
+    candidates.forEach((rendition, index) => {
+      const details = [
+        rendition.language,
+        rendition.channels ? `${rendition.channels} channels` : undefined,
+        rendition.default ? 'default' : undefined,
+      ]
+        .filter((value): value is string => Boolean(value))
+        .join(', ');
+      const name = sanitizeForDisplay(rendition.name || rendition.language || 'unnamed', 80);
+      console.log(`  [${index}] ${name}${details ? ` (${details})` : ''}`);
+    });
+  }
+
+  if (audioArg !== undefined) {
+    return candidates[parseAudioIndex(audioArg, candidates.length)]!;
+  }
+
+  if (candidates.length === 1) {
+    return candidates[0]!;
+  }
+
+  if (!stdin.isTTY) {
+    console.log('No TTY detected; selecting the default audio rendition.');
+    return candidates[0]!;
+  }
+
+  const rl = readline.createInterface({ input: stdin, output: stdout });
+  try {
+    const input = await rl.question(`Select audio (0-${candidates.length - 1}, default: 0): `);
+    const trimmed = input.trim();
+    return trimmed ? candidates[parseAudioIndex(trimmed, candidates.length)]! : candidates[0]!;
   } finally {
     rl.close();
   }
@@ -844,13 +909,16 @@ async function main(): Promise<void> {
       selectedVariant.audioGroup &&
       masterPlaylist.separateAudioGroups.includes(selectedVariant.audioGroup)
     ) {
-      audioRendition = selectAudioRendition(masterPlaylist.media, selectedVariant.audioGroup);
-      if (!audioRendition?.uri) {
-        throw new Error(
-          `The selected variant references audio group "${sanitizeForDisplay(selectedVariant.audioGroup, 80)}" without a separate rendition`,
-        );
+      audioRendition = await selectAudioRenditionForGroup(
+        masterPlaylist.media,
+        selectedVariant.audioGroup,
+        args.audio,
+      );
+      if (audioRendition) {
+        console.log(`Audio rendition: ${formatAudioRendition(audioRendition)}`);
       }
-      console.log(`Audio rendition: ${formatAudioRendition(audioRendition)}`);
+    } else if (args.audio !== undefined) {
+      throw new Error('--audio requires a master playlist with a separate audio rendition');
     }
 
     playlistUrl = resolveManifestUrl(selectedVariant.uri, masterUrl);
@@ -871,6 +939,8 @@ async function main(): Promise<void> {
     playlist = parseM3U8(variantBody);
   } else if (variantArg !== undefined) {
     throw new Error('variant-index can only be used with a master playlist');
+  } else if (args.audio !== undefined) {
+    throw new Error('--audio can only be used with a master playlist');
   }
 
   const expectedDuration = validateMediaPlaylist(playlist);

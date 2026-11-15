@@ -46,6 +46,9 @@ npx meow-loader https://example.com/stream.m3u8 my-video.mp4
 # Select a quality variant by index (highest quality is index 0)
 npx meow-loader https://example.com/master.m3u8 my-video.mp4 1
 
+# Select an audio rendition by index (master playlists)
+npx meow-loader https://example.com/master.m3u8 my-video.mp4 0 --audio 1
+
 # Inspect variants, duration, and estimated size without downloading
 npx meow-loader https://example.com/master.m3u8 --dry-run
 
@@ -108,12 +111,24 @@ Copied commands usually contain cookies and other credentials. They end up in sh
 ### Separate audio tracks
 
 When a master playlist declares audio renditions (`#EXT-X-MEDIA:TYPE=AUDIO`),
-meow-loader downloads the rendition marked `DEFAULT=YES`, falling back to
-`AUTOSELECT=YES` and then the first entry with a URI, and muxes it into the
-output. The chosen rendition is printed before downloading. If the variant's
-audio is already muxed, no separate download happens.
+meow-loader lists them and picks the one marked `DEFAULT=YES` by default:
 
-Manual language selection is not exposed yet.
+```
+Available audio renditions:
+  [0] English (en, default)
+  [1] Spanish (es)
+```
+
+Choose another rendition by index:
+
+```bash
+npx meow-loader https://example.com/master.m3u8 out.mp4 0 --audio 1
+```
+
+Index 0 is the default rendition, followed by `AUTOSELECT` entries and then
+playlist order. With multiple renditions and an interactive terminal, the CLI
+asks which one to use; non-interactive runs take the default. If the variant's
+audio is already muxed, no listing or separate download happens.
 
 ### Private networks and HTTP
 
@@ -265,7 +280,7 @@ playlists require a server or CDN that honors `Range` requests.
 - AES-128 encrypted HLS support, including key rotation and default IVs
 - MPEG-TS and fMP4/CMAF segments, including a single `#EXT-X-MAP` init segment
 - Byte-range (`#EXT-X-BYTERANGE`) playlists, including single-file HLS
-- Separate audio renditions, selected by DEFAULT/AUTOSELECT and muxed into the output
+- Separate audio renditions with default selection or `--audio <index>`, muxed into the output
 - Streamed segment downloads with incremental SHA-256 hashing
 - Segment container validation and ffprobe duration verification before replacing output
 - Resume interrupted downloads without treating partial files as complete
@@ -278,8 +293,6 @@ playlists require a server or CDN that honors `Range` requests.
 - `SAMPLE-AES` and `SAMPLE-AES-CTR` encryption are not supported.
 - Changing the `#EXT-X-MAP` initialization segment mid-playlist is not supported.
 - Live playlists (missing `#EXT-X-ENDLIST`) are not supported.
-- Audio renditions are selected automatically; there is no flag to choose a
-  different language yet.
 - The output is remuxed with `-c copy`; the codecs must be compatible with
   the MP4 container.
 - ffmpeg and ffprobe parse untrusted media. Keep them updated; use a sandbox or
