@@ -45,7 +45,7 @@ describe('downloader security', () => {
     });
   }
 
-  it('does not write through a pre-created symlink', async () => {
+  it.skipIf(process.platform === 'win32')('does not write through a pre-created symlink', async () => {
     const victim = join(tempRoot, 'victim.txt');
     const destination = join(tempRoot, 'segment.ts.part');
     await writeFile(victim, 'ORIGINAL');

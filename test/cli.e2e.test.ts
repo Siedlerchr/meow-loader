@@ -906,15 +906,18 @@ media/all.mp4
     expect(error.stderr).toContain('different media playlist or variant');
   });
 
-  it('handles a resume directory containing quote and newline characters', async () => {
-    const resumeDir = join(tempRoot, "quote'\nfile 'injected.ts' dir");
-    const output = join(tempRoot, 'weird-resume.mp4');
-    await mkdir(resumeDir, { recursive: true });
+  it.skipIf(process.platform === 'win32')(
+    'handles a resume directory containing quote and newline characters',
+    async () => {
+      const resumeDir = join(tempRoot, "quote'\nfile 'injected.ts' dir");
+      const output = join(tempRoot, 'weird-resume.mp4');
+      await mkdir(resumeDir, { recursive: true });
 
-    await command([`${baseUrl}/media.m3u8`, output, '--resume', resumeDir]);
+      await command([`${baseUrl}/media.m3u8`, output, '--resume', resumeDir]);
 
-    expect((await readFile(output)).byteLength).toBeGreaterThan(0);
-  });
+      expect((await readFile(output)).byteLength).toBeGreaterThan(0);
+    },
+  );
 
   it('refuses to resume query-distinct variants that share a pathname', async () => {
     const resumeDir = join(tempRoot, 'resume-query');
