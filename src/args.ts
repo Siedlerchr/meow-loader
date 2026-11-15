@@ -24,6 +24,7 @@ export interface ParsedArgs {
   mergeDir: string | undefined;
   audio: string | undefined;
   audioLanguage: string | undefined;
+  subtitle: string | undefined;
   retries: number;
   timeoutMs: number;
   force: boolean;
@@ -46,6 +47,7 @@ Options:
   --header-origin <origin>        Send custom headers to this origin too (repeatable)
   --audio <index>                 Select an audio rendition (master playlists)
   --audio-language <lang>         Select an audio rendition by language or name
+  --subtitle <index>              Select a subtitle rendition (master playlists)
   --retries <n>                   Attempts per download (default: 3)
   --timeout <seconds>             Network timeout (default: 120)
   --resume <dir>                  Resume a partial download from a saved working dir
@@ -77,6 +79,7 @@ Examples:
     --header-origin https://cdn.example.com
   meow-loader curl 'https://example.com/video.m3u8' -b 'session=abc123'
   meow-loader https://example.com/master.m3u8 out.mp4 0 --audio 1
+  meow-loader https://example.com/master.m3u8 out.mp4 --subtitle 0
   meow-loader https://example.com/video.m3u8 --resume /tmp/meow-abc123
   meow-loader --merge-only /tmp/meow-abc123 saved.mp4
   meow-loader https://example.com/video.m3u8 --dry-run`;
@@ -151,6 +154,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   let mergeDir: string | undefined;
   let audio: string | undefined;
   let audioLanguage: string | undefined;
+  let subtitle: string | undefined;
   let retries = DEFAULT_RETRIES;
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   let force = false;
@@ -336,6 +340,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
       continue;
     }
 
+    const subtitleOption = takeValue(argv, i, '--subtitle');
+    if (subtitleOption) {
+      if (subtitleOption.value === undefined) {
+        throw new Error('--subtitle requires a rendition index');
+      }
+      i = subtitleOption.next;
+      subtitle = subtitleOption.value;
+      continue;
+    }
+
     const retriesOption = takeValue(argv, i, '--retries');
     if (retriesOption) {
       if (retriesOption.value === undefined) {
@@ -432,6 +446,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     mergeDir,
     audio,
     audioLanguage,
+    subtitle,
     retries,
     timeoutMs,
     force,

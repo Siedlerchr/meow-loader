@@ -56,6 +56,7 @@ export interface M3U8Variant {
   resolution?: string;
   uri: string;
   audioGroup?: string;
+  subtitleGroup?: string;
 }
 
 export function parseM3U8(content: string): M3U8Playlist {
@@ -266,6 +267,7 @@ export function parseM3U8(content: string): M3U8Playlist {
         resolution: attrs.RESOLUTION,
         uri: line,
         audioGroup: attrs.AUDIO,
+        subtitleGroup: attrs.SUBTITLES,
       });
       pendingVariantAttrs = undefined;
       continue;
@@ -314,9 +316,10 @@ export function sortVariantsByBandwidth(variants: M3U8Variant[]): M3U8Variant[] 
  * Audio renditions that have their own playlist, ordered for display and
  * selection: DEFAULT first, then AUTOSELECT, then playlist order.
  */
-export function sortAudioRenditions(
+function sortRenditions(
   media: M3U8Media[] | undefined,
   groupId: string | undefined,
+  type: string,
 ): M3U8Media[] {
   if (!groupId || !media) {
     return [];
@@ -325,10 +328,24 @@ export function sortAudioRenditions(
   const rank = (entry: M3U8Media): number => (entry.default ? 0 : entry.autoselect ? 1 : 2);
 
   return media
-    .filter(entry => entry.type === 'AUDIO' && entry.groupId === groupId && entry.uri)
+    .filter(entry => entry.type === type && entry.groupId === groupId && entry.uri)
     .map((entry, index) => ({ entry, index }))
     .sort((a, b) => rank(a.entry) - rank(b.entry) || a.index - b.index)
     .map(item => item.entry);
+}
+
+export function sortAudioRenditions(
+  media: M3U8Media[] | undefined,
+  groupId: string | undefined,
+): M3U8Media[] {
+  return sortRenditions(media, groupId, 'AUDIO');
+}
+
+export function sortSubtitleRenditions(
+  media: M3U8Media[] | undefined,
+  groupId: string | undefined,
+): M3U8Media[] {
+  return sortRenditions(media, groupId, 'SUBTITLES');
 }
 
 /**

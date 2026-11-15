@@ -6,6 +6,7 @@ import {
   parseM3U8,
   selectAudioRendition,
   sortAudioRenditions,
+  sortSubtitleRenditions,
   sortVariantsByBandwidth,
 } from '../src/m3u8-parser';
 
@@ -455,6 +456,21 @@ video.m3u8
 
       expect(selectAudioRendition(playlist.media, 'aud')).toBeUndefined();
       expect(playlist.separateAudioGroups).toEqual([]);
+    });
+
+    it('parses subtitle renditions and the variant SUBTITLES group', () => {
+      const playlist = parseM3U8(`#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,URI="subs/en.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Spanish",LANGUAGE="es",DEFAULT=NO,URI="subs/es.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,SUBTITLES="subs"
+video.m3u8
+`);
+
+      expect(playlist.variants![0]!.subtitleGroup).toBe('subs');
+      expect(sortSubtitleRenditions(playlist.media, 'subs').map(entry => entry.name)).toEqual([
+        'English',
+        'Spanish',
+      ]);
     });
 
     it('returns undefined for an unknown group', () => {

@@ -52,6 +52,9 @@ npx meow-loader https://example.com/master.m3u8 my-video.mp4 0 --audio 1
 # Select an audio rendition by language or name
 npx meow-loader https://example.com/master.m3u8 my-video.mp4 --audio-language es
 
+# Select a subtitle rendition (master playlists)
+npx meow-loader https://example.com/master.m3u8 my-video.mp4 --subtitle 0
+
 # Retry a failed download up to five attempts, with a 60 second timeout
 npx meow-loader https://example.com/stream.m3u8 --retries 5 --timeout 60
 
@@ -141,6 +144,23 @@ and falls back to the rendition name. `--audio` and `--audio-language` cannot
 be combined. With multiple renditions and an interactive terminal, the CLI
 asks which one to use; non-interactive runs take the default. If the variant's
 audio is already muxed, no listing or separate download happens.
+
+### Subtitles
+
+When a master playlist declares subtitle renditions
+(`#EXT-X-MEDIA:TYPE=SUBTITLES`), meow-loader downloads the `DEFAULT=YES`
+rendition (then `AUTOSELECT`, then the first) and writes a sidecar WebVTT file
+next to the MP4:
+
+```
+video.mp4
+video.en.vtt
+```
+
+Choose another rendition with `--subtitle <index>`; the list is printed with
+the same default ordering as audio. Subtitles are not muxed into the MP4, and
+`--merge-only` does not recreate them because they are not stored in the resume
+directory. Byte-range and encrypted subtitle segments are not supported.
 
 ### Private networks and HTTP
 
@@ -319,6 +339,7 @@ playlists require a server or CDN that honors `Range` requests.
 - MPEG-TS and fMP4/CMAF segments, including a single `#EXT-X-MAP` init segment
 - Byte-range (`#EXT-X-BYTERANGE`) playlists, including single-file HLS
 - Separate audio renditions with default selection or `--audio <index>`, muxed into the output
+- Sidecar WebVTT subtitles (`--subtitle <index>`)
 - Streamed segment downloads with incremental SHA-256 hashing
 - Segment container validation and ffprobe duration verification before replacing output
 - Resume interrupted downloads without treating partial files as complete
@@ -335,6 +356,8 @@ playlists require a server or CDN that honors `Range` requests.
 - Live playlists (missing `#EXT-X-ENDLIST`) are not supported.
 - The output is remuxed with `-c copy`; the codecs must be compatible with
   the MP4 container.
+- Subtitles are written as sidecar `.vtt` files, not muxed into the MP4.
+- Byte-range and encrypted subtitle segments are not supported.
 - ffmpeg and ffprobe parse untrusted media. Keep them updated; use a sandbox or
   container if you need stronger isolation.
 - SSRF protection resolves hostnames and blocks private ranges before requests.

@@ -95,6 +95,13 @@ describe('parseArgs', () => {
     );
   });
 
+  it('parses --subtitle', () => {
+    expect(parseArgs(['node', 'meow-loader', 'master.m3u8', '--subtitle', '1']).subtitle).toBe('1');
+    expect(() => parseArgs(['node', 'meow-loader', 'master.m3u8', '--subtitle'])).toThrow(
+      '--subtitle requires a rendition index',
+    );
+  });
+
   it('parses --concurrency', () => {
     expect(parseArgs(['node', 'meow-loader', 'video.m3u8']).concurrency).toBe(1);
     expect(parseArgs(['node', 'meow-loader', 'video.m3u8', '--concurrency', '4']).concurrency).toBe(4);

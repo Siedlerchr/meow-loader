@@ -1,5 +1,10 @@
 #!/usr/bin/env node
-import { parseM3U8, sortAudioRenditions, sortVariantsByBandwidth } from './src/m3u8-parser';
+import {
+  parseM3U8,
+  sortAudioRenditions,
+  sortSubtitleRenditions,
+  sortVariantsByBandwidth,
+} from './src/m3u8-parser';
 import type {
   M3U8Map,
   M3U8Media,
@@ -7,7 +12,11 @@ import type {
   M3U8Segment,
   M3U8Variant,
 } from './src/m3u8-parser';
-import { downloadInitSegmentToFile, downloadSegmentToFile } from './src/downloader';
+import {
+  downloadInitSegmentToFile,
+  downloadSegmentToFile,
+  resolveUrl,
+} from './src/downloader';
 import { abortActiveMerge, mergeToMp4, muxToMp4 } from './src/merger';
 import type { HlsContainer } from './src/segment-validation';
 import {
@@ -18,10 +27,11 @@ import {
 } from './src/args';
 import { formatBytes, formatDuration, sanitizeForDisplay, sanitizeMultiline } from './src/display';
 import { DiskSpaceError, DownloadLimitError, SegmentLimitError } from './src/errors';
-import { NetworkClient, readResponseText, UrlPolicyError } from './src/network';
+import { NetworkClient, readResponseBytes, readResponseText, UrlPolicyError } from './src/network';
 import { getUniqueFilePath, pickAvailableOutputPath } from './src/output-path';
 import { DownloadProgress, ParallelDownloadProgress } from './src/progress';
 import { validateMp4Output } from './src/output-validation';
+import { isValidWebVttSegment, mergeWebVttSegments } from './src/webvtt';
 import {
   cleanupResumeState,
   initializeResumeState,
@@ -38,10 +48,21 @@ import readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, mkdtemp, lstat, realpath, rename, rm, stat, statfs, access } from 'node:fs/promises';
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rename,
+  rm,
+  stat,
+  statfs,
+  writeFile,
+} from 'node:fs/promises';
 import { constants, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, parse as parsePath, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import type { ParsedArgs } from './src/args';
 
@@ -87,17 +108,25 @@ function parseVariantIndex(value: string, count: number): number {
   return index;
 }
 
-function parseAudioIndex(value: string, count: number): number {
+function parseRenditionIndex(value: string, count: number, label: string): number {
   if (!/^\d+$/.test(value)) {
-    throw new Error(`Invalid audio index "${sanitizeForDisplay(value, 40)}". Choose 0-${count - 1}`);
+    throw new Error(`Invalid ${label} index "${sanitizeForDisplay(value, 40)}". Choose 0-${count - 1}`);
   }
 
   const index = Number(value);
   if (!Number.isInteger(index) || index < 0 || index >= count) {
-    throw new Error(`Invalid audio index. Choose 0-${count - 1}`);
+    throw new Error(`Invalid ${label} index. Choose 0-${count - 1}`);
   }
 
   return index;
+}
+
+function parseAudioIndex(value: string, count: number): number {
+  return parseRenditionIndex(value, count, 'audio');
+}
+
+function parseSubtitleIndex(value: string, count: number): number {
+  return parseRenditionIndex(value, count, 'subtitle');
 }
 
 async function selectVariant(variants: M3U8Variant[], variantArg: string | undefined): Promise<M3U8Variant> {
@@ -133,26 +162,37 @@ async function selectVariant(variants: M3U8Variant[], variantArg: string | undef
   }
 }
 
-async function selectAudioRenditionForGroup(
-  media: M3U8Media[] | undefined,
-  groupId: string,
-  audioArg: string | undefined,
-  languageArg: string | undefined,
+interface RenditionSelectionOptions {
+  media: M3U8Media[] | undefined;
+  groupId: string;
+  type: 'AUDIO' | 'SUBTITLES';
+  indexArg: string | undefined;
+  languageArg?: string;
+  label: 'audio' | 'subtitle';
+  flagName: string;
+  parseIndex: (value: string, count: number) => number;
+}
+
+async function selectRenditionForGroup(
+  options: RenditionSelectionOptions,
 ): Promise<M3U8Media | undefined> {
-  const candidates = sortAudioRenditions(media, groupId);
+  const candidates =
+    options.type === 'AUDIO'
+      ? sortAudioRenditions(options.media, options.groupId)
+      : sortSubtitleRenditions(options.media, options.groupId);
+  const { indexArg, languageArg, label, flagName, parseIndex } = options;
 
   if (candidates.length === 0) {
-    if (audioArg !== undefined || languageArg !== undefined) {
-      const flag = audioArg !== undefined ? '--audio' : '--audio-language';
+    if (indexArg !== undefined || languageArg !== undefined) {
       throw new Error(
-        `${flag} cannot be used: the selected variant has no separate audio rendition`,
+        `${flagName} cannot be used: the selected variant has no separate ${label} rendition`,
       );
     }
     return undefined;
   }
 
   if (candidates.length > 1) {
-    console.log('Available audio renditions:');
+    console.log(`Available ${label} renditions:`);
     candidates.forEach((rendition, index) => {
       const details = [
         rendition.language,
@@ -166,8 +206,8 @@ async function selectAudioRenditionForGroup(
     });
   }
 
-  if (audioArg !== undefined) {
-    return candidates[parseAudioIndex(audioArg, candidates.length)]!;
+  if (indexArg !== undefined) {
+    return candidates[parseIndex(indexArg, candidates.length)]!;
   }
 
   if (languageArg !== undefined) {
@@ -186,7 +226,7 @@ async function selectAudioRenditionForGroup(
         .map(rendition => rendition.language || rendition.name || 'unnamed')
         .join(', ');
       throw new Error(
-        `No audio rendition matches "${sanitizeForDisplay(languageArg, 40)}". Available: ${available}`,
+        `No ${label} rendition matches "${sanitizeForDisplay(languageArg, 40)}". Available: ${available}`,
       );
     }
 
@@ -198,15 +238,17 @@ async function selectAudioRenditionForGroup(
   }
 
   if (!stdin.isTTY) {
-    console.log('No TTY detected; selecting the default audio rendition.');
+    console.log(`No TTY detected; selecting the default ${label} rendition.`);
     return candidates[0]!;
   }
 
   const rl = readline.createInterface({ input: stdin, output: stdout });
   try {
-    const input = await rl.question(`Select audio (0-${candidates.length - 1}, default: 0): `);
+    const input = await rl.question(
+      `Select ${label} (0-${candidates.length - 1}, default: 0): `,
+    );
     const trimmed = input.trim();
-    return trimmed ? candidates[parseAudioIndex(trimmed, candidates.length)]! : candidates[0]!;
+    return trimmed ? candidates[parseIndex(trimmed, candidates.length)]! : candidates[0]!;
   } finally {
     rl.close();
   }
@@ -743,7 +785,96 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
     progress.finish();
     await rm(trackWorkDir, { recursive: true, force: true }).catch(() => {});
   }
-}async function replaceFile(source: string, target: string): Promise<void> {
+}
+const SUBTITLE_SEGMENT_MAX_BYTES = 16 * 1024 ** 2;
+
+function renditionTag(rendition: M3U8Media): string {
+  const raw = rendition.language || rendition.name || 'subs';
+  const tag = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return tag || 'subs';
+}
+
+async function saveSubtitleSidecar(options: {
+  segments: M3U8Segment[];
+  playlistUrl: string;
+  network: NetworkClient;
+  outputPath: string;
+  rendition: M3U8Media;
+  force: boolean;
+  retries: number;
+  timeoutMs: number;
+  maxSegmentBytes: number;
+  budget: DownloadBudget;
+}): Promise<void> {
+  const texts: string[] = [];
+
+  for (const segment of options.segments) {
+    if (segment.byterange) {
+      throw new Error('Byte-range subtitle segments are not supported');
+    }
+
+    const remaining =
+      options.budget.maxBytes > 0
+        ? options.budget.maxBytes - options.budget.usedBytes
+        : Infinity;
+    if (remaining <= 0) {
+      throw new DownloadLimitError(
+        `Download limit reached (${formatBytes(options.budget.maxBytes)}) while downloading subtitles.`,
+      );
+    }
+
+    const maxBytes = Math.min(SUBTITLE_SEGMENT_MAX_BYTES, options.maxSegmentBytes, remaining);
+    const url = resolveUrl(segment.uri, options.playlistUrl);
+    const response = await options.network.fetch(url, {}, {
+      attempts: options.retries,
+      label: 'subtitle segment',
+      timeoutMs: options.timeoutMs,
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Failed to download subtitle segment: ${redactUrl(url)} (${response.status})`,
+      );
+    }
+
+    const bytes = await readResponseBytes(response, maxBytes, 'Subtitle segment');
+    const text = new TextDecoder().decode(bytes);
+    if (!isValidWebVttSegment(text)) {
+      throw new Error(`Downloaded subtitle segment is not valid WebVTT: ${redactUrl(url)}`);
+    }
+
+    options.budget.usedBytes += bytes.byteLength;
+    texts.push(text);
+  }
+
+  const merged = mergeWebVttSegments(texts);
+  if (!merged.trim()) {
+    throw new Error('Subtitle playlist produced no cues');
+  }
+
+  const parsed = parsePath(options.outputPath);
+  const sidecar = join(parsed.dir, `${parsed.name}.${renditionTag(options.rendition)}.vtt`);
+  const target = pickAvailableOutputPath(sidecar, options.force);
+
+  if (target.renamed) {
+    console.log(`Subtitle file appeared; saving to: ${target.path}`);
+  }
+
+  const tempPath = join(parsed.dir, `.meow-subtitles-${process.pid}-${Date.now()}.tmp`);
+  try {
+    await writeFile(tempPath, merged, { mode: 0o600 });
+    await rename(tempPath, target.path);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
+
+  console.log(`Subtitles saved to: ${target.path}`);
+}
+
+async function replaceFile(source: string, target: string): Promise<void> {
   try {
     await rename(source, target);
     return;
@@ -823,7 +954,7 @@ function estimateBytes(bandwidth: number, duration: number): number | undefined 
   return Number.isFinite(estimate) ? estimate : undefined;
 }
 
-function formatAudioRendition(rendition: M3U8Media): string {
+function formatRendition(rendition: M3U8Media): string {
   const name = rendition.name || rendition.language || 'unnamed';
   const language = rendition.language ? ` (${sanitizeForDisplay(rendition.language, 40)})` : '';
   return `${sanitizeForDisplay(name, 80)}${language}`;
@@ -1058,6 +1189,7 @@ async function main(): Promise<void> {
   let selectedVariant: M3U8Variant | undefined;
 
   let audioRendition: M3U8Media | undefined;
+  let subtitleRendition: M3U8Media | undefined;
 
   if (playlist.isMaster) {
     if (!playlist.variants || playlist.variants.length === 0) {
@@ -1074,18 +1206,39 @@ async function main(): Promise<void> {
       selectedVariant.audioGroup &&
       masterPlaylist.separateAudioGroups.includes(selectedVariant.audioGroup)
     ) {
-      audioRendition = await selectAudioRenditionForGroup(
-        masterPlaylist.media,
-        selectedVariant.audioGroup,
-        args.audio,
-        args.audioLanguage,
-      );
+      audioRendition = await selectRenditionForGroup({
+        media: masterPlaylist.media,
+        groupId: selectedVariant.audioGroup,
+        type: 'AUDIO',
+        indexArg: args.audio,
+        languageArg: args.audioLanguage,
+        label: 'audio',
+        flagName: args.audio !== undefined ? '--audio' : '--audio-language',
+        parseIndex: parseAudioIndex,
+      });
       if (audioRendition) {
-        console.log(`Audio rendition: ${formatAudioRendition(audioRendition)}`);
+        console.log(`Audio rendition: ${formatRendition(audioRendition)}`);
       }
     } else if (args.audio !== undefined || args.audioLanguage !== undefined) {
       const flag = args.audio !== undefined ? '--audio' : '--audio-language';
       throw new Error(`${flag} requires a master playlist with a separate audio rendition`);
+    }
+
+    if (selectedVariant.subtitleGroup) {
+      subtitleRendition = await selectRenditionForGroup({
+        media: masterPlaylist.media,
+        groupId: selectedVariant.subtitleGroup,
+        type: 'SUBTITLES',
+        indexArg: args.subtitle,
+        label: 'subtitle',
+        flagName: '--subtitle',
+        parseIndex: parseSubtitleIndex,
+      });
+      if (subtitleRendition) {
+        console.log(`Subtitle rendition: ${formatRendition(subtitleRendition)}`);
+      }
+    } else if (args.subtitle !== undefined) {
+      throw new Error('--subtitle requires a master playlist with a separate subtitle rendition');
     }
 
     playlistUrl = resolveManifestUrl(selectedVariant.uri, masterUrl);
@@ -1106,8 +1259,17 @@ async function main(): Promise<void> {
     playlist = parseM3U8(variantBody);
   } else if (variantArg !== undefined) {
     throw new Error('variant-index can only be used with a master playlist');
-  } else if (args.audio !== undefined || args.audioLanguage !== undefined) {
-    const flag = args.audio !== undefined ? '--audio' : '--audio-language';
+  } else if (
+    args.audio !== undefined ||
+    args.audioLanguage !== undefined ||
+    args.subtitle !== undefined
+  ) {
+    const flag =
+      args.subtitle !== undefined
+        ? '--subtitle'
+        : args.audio !== undefined
+          ? '--audio'
+          : '--audio-language';
     throw new Error(`${flag} can only be used with a master playlist`);
   }
 
@@ -1154,6 +1316,48 @@ async function main(): Promise<void> {
     }
   }
 
+  let subtitlePlaylistUrl = subtitleRendition?.uri
+    ? resolveManifestUrl(subtitleRendition.uri, masterUrl)
+    : undefined;
+  let subtitleSegments: M3U8Segment[] | undefined;
+
+  if (subtitlePlaylistUrl) {
+    try {
+      console.log(`Fetching subtitle playlist: ${redactUrl(subtitlePlaylistUrl)}`);
+      const subtitleResponse = await network.fetch(subtitlePlaylistUrl, {}, {
+        attempts: args.retries,
+        label: 'subtitle playlist',
+      });
+      if (!subtitleResponse.ok) {
+        throw new Error(`Failed to fetch subtitle playlist: ${subtitleResponse.status}`);
+      }
+
+      subtitlePlaylistUrl = subtitleResponse.url || subtitlePlaylistUrl;
+      const subtitleBody = await readResponseText(subtitleResponse, DEFAULT_PLAYLIST_MAX_BYTES);
+      assertPlaylistBody(subtitleBody);
+      const subtitlePlaylist = parseM3U8(subtitleBody);
+      if (subtitlePlaylist.isMaster) {
+        throw new Error('The subtitle rendition points to another master playlist');
+      }
+
+      validateMediaPlaylist(subtitlePlaylist);
+      subtitleSegments = subtitlePlaylist.segments!;
+      if (subtitleSegments.some(segment => segment.encryption)) {
+        throw new Error('Encrypted subtitle segments are not supported');
+      }
+
+      console.log(`Subtitle segments: ${subtitleSegments.length}`);
+    } catch (error) {
+      if (args.subtitle !== undefined) {
+        throw error;
+      }
+      console.warn(`Warning: skipping subtitles: ${errorMessage(error)}`);
+      subtitleRendition = undefined;
+      subtitlePlaylistUrl = undefined;
+      subtitleSegments = undefined;
+    }
+  }
+
   const estimatedBytes = selectedVariant
     ? estimateBytes(selectedVariant.bandwidth, expectedDuration)
     : undefined;
@@ -1167,6 +1371,12 @@ async function main(): Promise<void> {
       console.log(`Audio container: ${audioContainer === 'fmp4' ? 'fMP4' : 'MPEG-TS'}`);
       if (audioDuration !== undefined) {
         console.log(`Audio duration: ${formatDuration(audioDuration)}`);
+      }
+    }
+    if (subtitleSegments) {
+      console.log(`Subtitle segments: ${subtitleSegments.length}`);
+      if (subtitleRendition?.language) {
+        console.log(`Subtitle language: ${sanitizeForDisplay(subtitleRendition.language, 40)}`);
       }
     }
     if (estimatedBytes !== undefined) {
@@ -1353,6 +1563,28 @@ async function main(): Promise<void> {
   } finally {
     await rm(outputTempDir, { recursive: true, force: true }).catch(() => {});
     outputTempDir = undefined;
+  }
+
+  if (subtitleSegments && subtitlePlaylistUrl && subtitleRendition) {
+    try {
+      await saveSubtitleSidecar({
+        segments: subtitleSegments,
+        playlistUrl: subtitlePlaylistUrl,
+        network,
+        outputPath: finalOutput.path,
+        rendition: subtitleRendition,
+        force: args.force,
+        retries: args.retries,
+        timeoutMs: args.timeoutMs,
+        maxSegmentBytes: args.maxSegmentSize,
+        budget,
+      });
+    } catch (error) {
+      if (args.subtitle !== undefined) {
+        throw new Error(`Failed to save subtitles: ${errorMessage(error)}`);
+      }
+      console.warn(`Warning: failed to save subtitles: ${errorMessage(error)}`);
+    }
   }
   try {
     await cleanupWorkingDirectory(tmpDir, ownsTempDir, args.cleanup, resume);

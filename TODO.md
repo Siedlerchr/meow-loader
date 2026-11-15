@@ -15,11 +15,11 @@
 
 ## Subtitles (sidecar WebVTT)
 
-- [ ] Parse `SUBTITLES` groups and renditions
-- [ ] `--subtitle <index>` with default/interactive selection
-- [ ] Download and concatenate WebVTT segments
-- [ ] Write `<output>.<language>.vtt`
-- [ ] Dry-run, errors, tests, docs
+- [x] Parse `SUBTITLES` groups and renditions
+- [x] `--subtitle <index>` with default/interactive selection
+- [x] Download and concatenate WebVTT segments
+- [x] Write `<output>.<language>.vtt`
+- [x] Dry-run, errors, tests, docs
 
 ## Release
 

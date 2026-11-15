@@ -75,6 +75,26 @@ av-video.m3u8
 
 const audioMasterLowBandwidth = audioMasterPlaylist.replace('BANDWIDTH=2000000', 'BANDWIDTH=1000');
 
+const subtitleMasterPlaylist = `#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="subs/playlist.m3u8?lang=en"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Spanish",LANGUAGE="es",DEFAULT=NO,AUTOSELECT=YES,URI="subs/playlist.m3u8?lang=es"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,SUBTITLES="subs"
+av-video.m3u8
+`;
+
+const brokenSubtitleMasterPlaylist = `#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Broken",LANGUAGE="en",DEFAULT=YES,URI="subs-bad/playlist.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,SUBTITLES="subs"
+av-video.m3u8
+`;
+
+const brokenSubtitlePlaylist = `#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+segment_0.vtt
+#EXT-X-ENDLIST
+`;
+
 const flakyPlaylist = `#EXTM3U
 #EXT-X-TARGETDURATION:10
 #EXTINF:10,
@@ -210,6 +230,7 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
   let slowInFlight = 0;
   let slowMaxConcurrent = 0;
   let flakyFailuresRemaining = 0;
+  let subtitleRequests: string[] = [];
   let byteRangePlaylist: string;
   let fmp4RangePlaylist: string;
   let tsRangeBody: Buffer;
@@ -334,6 +355,48 @@ media/all.mp4
             'content-type': fileName.endsWith('.m3u8')
               ? 'application/vnd.apple.mpegurl'
               : 'video/mp2t',
+          });
+          response.end(content);
+        } catch {
+          response.writeHead(404);
+          response.end('not found');
+        }
+        return;
+      }
+
+      if (pathname === '/subtitle-master.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(subtitleMasterPlaylist);
+        return;
+      }
+
+      if (pathname === '/subtitle-bad.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(brokenSubtitleMasterPlaylist);
+        return;
+      }
+
+      if (pathname === '/subs-bad/playlist.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(brokenSubtitlePlaylist);
+        return;
+      }
+
+      if (pathname === '/subs-bad/segment_0.vtt') {
+        response.writeHead(200, { 'content-type': 'text/html' });
+        response.end('<html><body>not subtitles</body></html>');
+        return;
+      }
+
+      if (pathname.startsWith('/subs/')) {
+        subtitleRequests.push(request.url || pathname);
+        const fileName = pathname.split('/').pop()!;
+        try {
+          const content = await readFile(join(fixtures, 'subs', fileName));
+          response.writeHead(200, {
+            'content-type': fileName.endsWith('.m3u8')
+              ? 'application/vnd.apple.mpegurl'
+              : 'text/vtt',
           });
           response.end(content);
         } catch {
@@ -1168,6 +1231,100 @@ media/all.mp4
 
     expect(error.code).toBe(1);
     expect(error.stderr).toMatch(/Request failed|abort/i);
+  });
+
+  it('downloads a subtitle sidecar', async () => {
+    subtitleRequests = [];
+    const info = await command([`${baseUrl}/subtitle-master.m3u8`, '--dry-run']);
+    expect(info.stdout).toContain('Subtitle segments: 3');
+    expect(info.stdout).toContain('Subtitle language: en');
+
+    const output = join(tempRoot, 'subtitled.mp4');
+    const { stdout } = await command([`${baseUrl}/subtitle-master.m3u8`, output]);
+
+    expect(stdout).toContain('Subtitle rendition: English (en)');
+    expect(stdout).toContain('Subtitles saved to:');
+    expect(subtitleRequests.some(url => url.includes('?lang=en'))).toBe(true);
+
+    const content = await readFile(join(tempRoot, 'subtitled.en.vtt'), 'utf8');
+    expect(content.match(/WEBVTT/g)).toHaveLength(1);
+    expect(content).toContain('Hello from segment one');
+    expect(content).toContain('Done');
+  });
+
+  it('selects a subtitle rendition by index', async () => {
+    subtitleRequests = [];
+    const output = join(tempRoot, 'subtitled-spanish.mp4');
+    const { stdout } = await command([
+      `${baseUrl}/subtitle-master.m3u8`,
+      output,
+      '--subtitle',
+      '1',
+    ]);
+
+    expect(stdout).toContain('Subtitle rendition: Spanish (es)');
+    expect(existsSync(join(tempRoot, 'subtitled-spanish.es.vtt'))).toBe(true);
+    expect(subtitleRequests.some(url => url.includes('?lang=es'))).toBe(true);
+    expect(subtitleRequests.some(url => url.includes('?lang=en'))).toBe(false);
+  });
+
+  it('rejects an out-of-range subtitle index', async () => {
+    const error = await command([
+      `${baseUrl}/subtitle-master.m3u8`,
+      join(tempRoot, 'bad-subtitle.mp4'),
+      '--subtitle',
+      '9',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('Invalid subtitle index. Choose 0-1');
+  });
+
+  it('rejects --subtitle without a master playlist', async () => {
+    const error = await command([
+      `${baseUrl}/media.m3u8`,
+      join(tempRoot, 'subtitle-flag.mp4'),
+      '--subtitle',
+      '0',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('--subtitle can only be used with a master playlist');
+  });
+
+  it('rejects --subtitle when the variant has no subtitles', async () => {
+    const error = await command([
+      `${baseUrl}/av-master.m3u8`,
+      join(tempRoot, 'no-subtitles.mp4'),
+      '--subtitle',
+      '0',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain(
+      '--subtitle requires a master playlist with a separate subtitle rendition',
+    );
+  });
+
+  it('skips a broken subtitle track without failing the video', async () => {
+    const output = join(tempRoot, 'broken-subtitles.mp4');
+    const { stderr } = await command([`${baseUrl}/subtitle-bad.m3u8`, output]);
+
+    expect(stderr).toContain('failed to save subtitles');
+    expect(existsSync(output)).toBe(true);
+    expect(existsSync(join(tempRoot, 'broken-subtitles.en.vtt'))).toBe(false);
+  });
+
+  it('fails when an explicitly selected subtitle track is broken', async () => {
+    const error = await command([
+      `${baseUrl}/subtitle-bad.m3u8`,
+      join(tempRoot, 'broken-subtitles-explicit.mp4'),
+      '--subtitle',
+      '0',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('Failed to save subtitles');
   });
 
   it('rejects an out-of-range audio index', async () => {
