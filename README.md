@@ -1,11 +1,12 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/amoshydra/meow-loader/refs/heads/main/assets/banner.png" alt="meow-loader banner" width="600" />
+  <img src="https://raw.githubusercontent.com/amoshydra/meow-loader/refs/heads/main/assets/banner.png" alt="meow-loader banner" width="420" />
 
   <strong>meow-loader</strong><br />
   <i>HLS / M3U8 downloader CLI</i>
   <br /><br />
 
   [![npm](https://img.shields.io/npm/v/meow-loader.svg)](https://www.npmjs.com/package/meow-loader)
+  [![CI](https://github.com/amoshydra/meow-loader/actions/workflows/ci.yml/badge.svg)](https://github.com/amoshydra/meow-loader/actions/workflows/ci.yml)
   [![License](https://img.shields.io/github/license/amoshydra/meow-loader.svg)](LICENSE)
   [![Node.js](https://img.shields.io/node/v/meow-loader.svg)](https://nodejs.org/)
 </div>
@@ -26,6 +27,7 @@ Despite the name, this is a command-line HLS downloader, not a webpack loader.
 
 - [Node.js](https://nodejs.org/) 22 or newer
 - [ffmpeg](https://ffmpeg.org/) and `ffprobe` available on your `PATH`
+- Linux, macOS, or Windows
 
 ```bash
 # macOS
