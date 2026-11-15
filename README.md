@@ -15,6 +15,10 @@ Download an HLS (M3U8) video stream and remux it into a single MP4 file.
 
 ```bash
 npx meow-loader <m3u8-url>
+
+# or install it once
+npm install -g meow-loader
+meow-loader <m3u8-url>
 ```
 
 Despite the name, this is a command-line HLS downloader, not a webpack loader.
@@ -34,7 +38,7 @@ Despite the name, this is a command-line HLS downloader, not a webpack loader.
 - **Paste a browser "Copy as cURL"** command and keep its headers and cookies
 - **Parallel segment downloads** (`--concurrency`) with shared size limits
 - **No re-encode**: streams are remuxed with ffmpeg `-c copy`
-- **One CLI on Linux, macOS, and Windows**, with Node.js 22+ and ffmpeg
+- **Runs on Linux, macOS, and Windows**, with Node.js 22+ and ffmpeg
 
 ## Requirements
 
@@ -104,6 +108,9 @@ npx meow-loader curl 'https://example.com/stream.m3u8' -H 'Pragma: no-cache'
 ```text
 $ npx meow-loader https://example.com/master.m3u8 --dry-run
 Fetching playlist: https://example.com/master.m3u8
+Master playlist detected. Available variants (highest first):
+  [0] 5000 kbps (1920x1080)
+  [1] 2500 kbps (1280x720)
 Selected variant: 1920x1080 @ 5000 kbps
 Fetching variant playlist: https://example.com/1080p.m3u8
 Segments: 1450
@@ -368,10 +375,10 @@ playlists require a server or CDN that honors `Range` requests.
 
 | Input | Supported | Notes |
 |---|:---:|---|
-| MPEG-TS and fMP4/CMAF segments | Yes | fMP4 playlists may use one `#EXT-X-MAP` init segment; changing it mid-playlist is unsupported |
-| Byte-range (`#EXT-X-BYTERANGE`) | Yes | The server or CDN must honor `Range` requests |
+| MPEG-TS and fMP4/CMAF | Yes | fMP4 playlists may use one `#EXT-X-MAP` init segment; changing it mid-playlist is unsupported |
+| Byte ranges | Yes | `#EXT-X-BYTERANGE`; the server or CDN must honor `Range` requests |
 | AES-128 encryption | Yes | Includes key rotation and default IVs |
-| Separate audio renditions | Yes | `--audio` or `--audio-language`; muxed into the MP4 |
+| Separate audio | Yes | `--audio` or `--audio-language`; muxed into the MP4 |
 | Subtitles | Yes (sidecar) | `--subtitle`; plain WebVTT only, not muxed; byte-range and encrypted subtitle segments are unsupported |
 | Live playlists | No | `#EXT-X-ENDLIST` is required |
 | DRM / SAMPLE-AES | No | Widevine, FairPlay, `SAMPLE-AES`, and `SAMPLE-AES-CTR` are unsupported |
@@ -384,13 +391,9 @@ playlists require a server or CDN that honors `Range` requests.
 - Interactive variant selection for master playlists
 - AES-128 encrypted HLS support, including key rotation and default IVs
 - MPEG-TS and fMP4/CMAF segments, including a single `#EXT-X-MAP` init segment
-- Byte-range (`#EXT-X-BYTERANGE`) playlists, including single-file HLS
-- Separate audio renditions with default selection or `--audio <index>`, muxed into the output
-- Sidecar WebVTT subtitles (`--subtitle <index>`)
 - Streamed segment downloads with incremental SHA-256 hashing
 - Segment container validation and ffprobe duration verification before replacing output
 - Resume interrupted downloads without treating partial files as complete
-- Merge segments into a single MP4 via ffmpeg
 - Optional parallel segment downloads with shared limits (`--concurrency`)
 - Configurable retries, timeouts, and interruption cleanup
 - Per-origin header scoping, SSRF protection, and request timeouts
