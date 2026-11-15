@@ -18,6 +18,10 @@ npx meow-loader <m3u8-url>
 
 Despite the name, this is a command-line HLS downloader, not a webpack loader.
 
+<div align="center">
+  <img src="https://raw.githubusercontent.com/amoshydra/meow-loader/main/assets/demo.svg" alt="Animated meow-loader demo: selecting a variant, audio and subtitles, downloading segments in parallel, and saving an MP4 with a WebVTT sidecar" width="860" />
+</div>
+
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 22 or newer

@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" role="img" aria-labelledby="demo-title demo-desc">
+  <title id="demo-title">meow-loader animated terminal demo</title>
+  <desc id="demo-desc">A simulated terminal session: select a variant, audio and subtitle renditions, download 499 segments in parallel, and save out.mp4 with an English WebVTT sidecar.</desc>
+  <style>
+    .phase { opacity: 1; }
+    .counter-a, .counter-b { opacity: 0; }
+    .counter-c { opacity: 1; }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .phase, .counter-a, .counter-b, .counter-c {
+        animation-duration: 14s;
+        animation-iteration-count: infinite;
+        animation-timing-function: linear;
+      }
+      .cmd { animation-name: show-cmd; }
+      .lists { animation-name: show-lists; }
+      .progress { animation-name: show-progress; }
+      .done { animation-name: show-done; }
+      .counter-a { animation-name: counter-a; }
+      .counter-b { animation-name: counter-b; }
+      .counter-c { animation-name: counter-c; }
+    }
+
+    @keyframes show-cmd { 0%, 1% { opacity: 0; } 2%, 96% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes show-lists { 0%, 7% { opacity: 0; } 8%, 96% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes show-progress { 0%, 23% { opacity: 0; } 24%, 96% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes show-done { 0%, 61% { opacity: 0; } 62%, 96% { opacity: 1; } 100% { opacity: 0; } }
+    @keyframes counter-a { 0%, 23% { opacity: 0; } 24%, 41% { opacity: 1; } 42%, 100% { opacity: 0; } }
+    @keyframes counter-b { 0%, 41% { opacity: 0; } 42%, 59% { opacity: 1; } 60%, 100% { opacity: 0; } }
+    @keyframes counter-c { 0%, 59% { opacity: 0; } 60%, 96% { opacity: 1; } 97%, 100% { opacity: 0; } }
+  </style>
+
+  <rect x="1" y="1" width="898" height="418" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+  <path d="M1 37 H899" stroke="#30363d" stroke-width="1"/>
+  <circle cx="24" cy="19" r="5" fill="#ff5f56"/>
+  <circle cx="42" cy="19" r="5" fill="#ffbd2e"/>
+  <circle cx="60" cy="19" r="5" fill="#27c93f"/>
+  <text x="80" y="23" fill="#8b949e" font-size="12">meow-loader — HLS → MP4</text>
+  <text x="878" y="23" fill="#484f58" font-size="11" text-anchor="end">demo</text>
+
+  <g class="phase cmd">
+    <text x="22" y="64" fill="#e6edf3"><tspan fill="#7ee787">$</tspan> npx meow-loader https://example.com/master.m3u8 out.mp4 \</text>
+    <text x="42" y="85" fill="#8b949e">--audio-language en --subtitle 0</text>
+  </g>
+
+  <g class="phase lists">
+    <text x="22" y="116" fill="#8b949e">Master playlist detected. Available variants (highest first):</text>
+    <text x="42" y="137" fill="#c9d1d9"><tspan fill="#58a6ff">[0]</tspan> 5000 kbps (1920x1080) <tspan fill="#8b949e">[audio: aud]</tspan></text>
+    <text x="42" y="158" fill="#c9d1d9"><tspan fill="#58a6ff">[1]</tspan> 2500 kbps (1280x720) <tspan fill="#8b949e">[audio: aud]</tspan></text>
+    <text x="22" y="179" fill="#7ee787">Selected variant: 1920x1080 @ 5000 kbps</text>
+    <text x="22" y="200" fill="#8b949e">Audio: English (en, default) · Subtitles: English (en, default)</text>
+  </g>
+
+  <g class="phase progress">
+    <text x="22" y="228" fill="#c9d1d9">Downloading 499 segments...</text>
+    <text x="22" y="249" fill="#8b949e">Using up to 3 parallel segment downloads.</text>
+    <rect x="22" y="264" width="856" height="8" rx="4" fill="#21262d"/>
+    <rect x="22" y="264" width="856" height="8" rx="4" fill="#7ee787">
+      <animate attributeName="width" values="0;0;856;856;0" keyTimes="0;0.24;0.60;0.96;1" dur="14s" repeatCount="indefinite"/>
+    </rect>
+    <g class="counter-a"><text x="22" y="294" fill="#c9d1d9">Segments 1/499 · 3 active · total 1.4 MB · 812 KB/s · ETA 9:58</text></g>
+    <g class="counter-b"><text x="22" y="294" fill="#c9d1d9">Segments 250/499 · 3 active · total 370.2 MB · 1.2 MB/s · ETA 3:27</text></g>
+    <g class="counter-c"><text x="22" y="294" fill="#c9d1d9">Segments 499/499 · total 740.7 MB · 1.2 MB/s</text></g>
+  </g>
+
+  <g class="phase done">
+    <text x="22" y="328" fill="#8b949e">Merging 740.7 MB into MP4...</text>
+    <text x="22" y="349" fill="#8b949e">Verifying output...</text>
+    <text x="22" y="370" fill="#8b949e">Subtitles saved to: /videos/out.en.vtt</text>
+    <text x="22" y="391" fill="#7ee787" font-weight="bold">Done! Saved to: /videos/out.mp4</text>
+  </g>
+</svg>
