@@ -173,7 +173,15 @@ export class NetworkClient {
 
       const headers = this.headersFor(current);
       if (init.headers) {
-        new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+        // Range is a non-sensitive, request-specific header needed for
+        // byte-range playlists, including when the origin redirects to a CDN.
+        // Every other init header stays on the original request so it cannot
+        // leak to an unapproved redirect target.
+        new Headers(init.headers).forEach((value, key) => {
+          if (redirects === 0 || key.toLowerCase() === 'range') {
+            headers.set(key, value);
+          }
+        });
       }
 
       const timeoutSignal =
@@ -213,7 +221,13 @@ export class NetworkClient {
       }
 
       await response.body?.cancel();
-      current = new URL(location, current);
+      try {
+        current = new URL(location, current);
+      } catch {
+        throw new UrlPolicyError(
+          `Invalid redirect target in ${label}: ${redactUrl(location)}`,
+        );
+      }
     }
 
     throw new Error(`Too many redirects while fetching ${redactUrl(url)}`);
@@ -460,6 +474,20 @@ function isPrivateIpv6(address: string): boolean {
   if (bytes.slice(0, 12).every(byte => byte === 0)) {
     return isPrivateIpv4(bytes.slice(12).join('.'));
   }
+  // IPv4-translated (::ffff:0:0:0/96).
+  if (
+    bytes.slice(0, 8).every(byte => byte === 0) &&
+    bytes[8] === 0xff &&
+    bytes[9] === 0xff &&
+    bytes[10] === 0x00 &&
+    bytes[11] === 0x00
+  ) {
+    return isPrivateIpv4(bytes.slice(12).join('.'));
+  }
+  // 6to4 (2002::/16) and Teredo (2001::/32) embed IPv4 or tunnel packets;
+  // both are deprecated and have no place in an HLS download.
+  if (bytes[0] === 0x20 && bytes[1] === 0x02) return true;
+  if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x00) return true;
 
   if ((bytes[0]! & 0xfe) === 0xfc) return true; // fc00::/7
   if (bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0x80) return true; // fe80::/10

@@ -35,7 +35,10 @@ It defends against:
   re-resolves.
 - **Cross-origin header and cookie leakage.** Custom headers are scoped to the
   playlist origin unless `--header-origin` allows another origin. Redirects do
-  not forward them to unapproved origins.
+  not forward them to unapproved origins. The internal `Range` header is
+  forwarded across redirects because it carries no credentials and byte-range
+  playlists depend on it; other request-specific headers are limited to the
+  original request.
 - **Path traversal and arbitrary file writes from playlist data.** Segment and
   init filenames are generated, resume metadata filenames are regex-validated,
   FFmpeg concat inputs use generated relative names, and temporary files are
@@ -68,6 +71,9 @@ It defends against:
 - **Credentials in shell history.** Cookies and `Authorization` headers pasted
   via cURL end up in shell history. Header values are not printed by
   meow-loader, but the user must protect their history.
+- **Path tokens in logs.** URL query strings, credentials, and fragments are
+  redacted, but path segments are printed for diagnostics. Some providers put
+  tokens in the path; avoid sharing logs of untrusted streams.
 - **Supply chain.** npm dependencies and the `ffmpeg` binary are part of the
   trust base. Use the lockfile, `pnpm audit`, and a trusted ffmpeg build.
 - **DRM and live content** are unsupported; that is a functionality boundary,

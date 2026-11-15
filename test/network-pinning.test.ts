@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { NetworkClient } from '../src/network';
+import { NetworkClient, isPrivateAddress } from '../src/network';
 
 describe('DNS pinning', () => {
   let server: Server;
@@ -12,6 +12,21 @@ describe('DNS pinning', () => {
       if (request.url === '/redirect') {
         response.writeHead(302, { location: `http://second.example:${port}/ok` });
         response.end();
+        return;
+      }
+      if (request.url === '/bad-redirect') {
+        response.writeHead(302, { location: 'http://' });
+        response.end();
+        return;
+      }
+      if (request.url === '/header-redirect') {
+        response.writeHead(302, { location: `http://second.example:${port}/inspect` });
+        response.end();
+        return;
+      }
+      if (request.url === '/inspect') {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify(request.headers));
         return;
       }
 
@@ -89,6 +104,37 @@ describe('DNS pinning', () => {
     );
   });
 
+  it('treats an unparsable redirect target as a non-retryable policy error', async () => {
+    const client = createClient({
+      playlistUrl: `http://pinned.example:${port}/`,
+      allowPrivateNetwork: true,
+      dnsLookup: async () => [{ address: '127.0.0.1', family: 4 }],
+    });
+
+    await expect(
+      client.fetch(`http://pinned.example:${port}/bad-redirect`, {}, { attempts: 3 }),
+    ).rejects.toThrow('Invalid redirect target');
+  });
+
+  it('does not leak non-Range init headers across redirects', async () => {
+    const client = createClient({
+      playlistUrl: `http://first.example:${port}/`,
+      allowPrivateNetwork: true,
+      dnsLookup: async () => [{ address: '127.0.0.1', family: 4 }],
+    });
+
+    const response = await client.fetch(`http://first.example:${port}/header-redirect`, {
+      headers: {
+        Range: 'bytes=0-9',
+        'X-Secret': 'do-not-forward',
+      },
+    });
+    const headers = JSON.parse(await response.text()) as Record<string, string>;
+
+    expect(headers.range).toBe('bytes=0-9');
+    expect(headers['x-secret']).toBeUndefined();
+  });
+
   it('caches validated addresses for the configured TTL', async () => {
     let lookups = 0;
     const client = createClient({
@@ -105,5 +151,15 @@ describe('DNS pinning', () => {
     await (await client.fetch(`http://cached.example:${port}/b`, {})).text();
 
     expect(lookups).toBe(1);
+  });
+
+  it('classifies IPv4-embedding IPv6 ranges and deprecated tunnels as private', () => {
+    expect(isPrivateAddress('2002:7f00:1::')).toBe(true);
+    expect(isPrivateAddress('2002:c0a8:101::')).toBe(true);
+    expect(isPrivateAddress('2001:0:4136:e378:8000:63bf:3fff:fdd2')).toBe(true);
+    expect(isPrivateAddress('::ffff:0:7f00:1')).toBe(true);
+    expect(isPrivateAddress('::ffff:7f00:1')).toBe(true);
+    expect(isPrivateAddress('2001:4860:4860::8888')).toBe(false);
+    expect(isPrivateAddress('8.8.8.8')).toBe(false);
   });
 });

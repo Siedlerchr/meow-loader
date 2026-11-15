@@ -264,6 +264,18 @@ describe('header validation', () => {
     }
   });
 
+  it('rejects control characters and non-Latin-1 header values', () => {
+    expect(() => run(['https://example.com/a.m3u8', '-H', 'X-Test: a\u000bb'])).toThrow(
+      'control characters are not allowed',
+    );
+    expect(() => run(['https://example.com/a.m3u8', '-H', 'X-Test: \u2603'])).toThrow(
+      'only Latin-1 characters are supported',
+    );
+    expect(() => run(['curl', 'https://example.com/a.m3u8', '-b', 'a=\u0001'])).toThrow(
+      'control characters are not allowed',
+    );
+  });
+
   it('rejects invalid header names', () => {
     expect(() => run(['https://example.com/a.m3u8', '-H', 'Bad Header: value'])).toThrow(
       'Invalid header name',

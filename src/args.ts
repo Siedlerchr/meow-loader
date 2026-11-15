@@ -138,6 +138,7 @@ function setHeader(headers: Record<string, string>, name: string, value: string)
 }
 
 function appendHeader(headers: Record<string, string>, name: string, value: string): void {
+  assertValidHeaderValue(name, value);
   const existing = findHeaderKey(headers, name);
   if (existing === undefined) {
     headers[name] = value;

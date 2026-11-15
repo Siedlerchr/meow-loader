@@ -120,6 +120,7 @@ async function downloadFile(
   }
 
   if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
     throw new Error(`Failed to download ${spec.label}: ${redactUrl(url)} (${response.status})`);
   }
   if (byterange && response.status !== 206) {
@@ -286,6 +287,7 @@ async function getKey(
     attempts: options.attempts,
   });
   if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
     throw new Error(`Failed to download encryption key: ${redactUrl(keyUrl)} (${response.status})`);
   }
 

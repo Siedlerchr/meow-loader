@@ -890,6 +890,7 @@ async function saveSubtitleSidecar(options: {
       timeoutMs: options.timeoutMs,
     });
     if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
       throw new Error(
         `Failed to download subtitle segment: ${redactUrl(url)} (${response.status})`,
       );
@@ -1273,6 +1274,7 @@ async function main(): Promise<void> {
   console.log(`Fetching playlist: ${redactUrl(url)}`);
   const response = await network.fetch(url, {}, { attempts: args.retries, label: 'playlist' });
   if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
     throw new Error(`Failed to fetch playlist: ${response.status}`);
   }
 
@@ -1345,6 +1347,7 @@ async function main(): Promise<void> {
 
     const variantResponse = await network.fetch(playlistUrl, {}, { attempts: args.retries, label: 'variant playlist' });
     if (!variantResponse.ok) {
+      await variantResponse.body?.cancel().catch(() => {});
       throw new Error(`Failed to fetch variant playlist: ${variantResponse.status}`);
     }
 
@@ -1388,6 +1391,7 @@ async function main(): Promise<void> {
       label: 'audio playlist',
     });
     if (!audioResponse.ok) {
+      await audioResponse.body?.cancel().catch(() => {});
       throw new Error(`Failed to fetch audio playlist: ${audioResponse.status}`);
     }
 
@@ -1424,6 +1428,7 @@ async function main(): Promise<void> {
         label: 'subtitle playlist',
       });
       if (!subtitleResponse.ok) {
+        await subtitleResponse.body?.cancel().catch(() => {});
         throw new Error(`Failed to fetch subtitle playlist: ${subtitleResponse.status}`);
       }
 

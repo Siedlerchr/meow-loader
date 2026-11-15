@@ -60,8 +60,15 @@ export function buildRequestHeaders(userHeaders: Record<string, string> = {}): H
 }
 
 export function assertValidHeaderValue(name: string, value: string): void {
-  if (/[\r\n\0]/.test(value)) {
-    throw new Error(`Invalid value for header "${truncateHeaderName(name)}": line breaks are not allowed`);
+  if (/[\u0000-\u0008\u000a-\u001f\u007f-\u009f]/.test(value)) {
+    throw new Error(
+      `Invalid value for header "${truncateHeaderName(name)}": control characters are not allowed`,
+    );
+  }
+  if (/[^\u0000-\u00ff]/.test(value)) {
+    throw new Error(
+      `Invalid value for header "${truncateHeaderName(name)}": only Latin-1 characters are supported`,
+    );
   }
 }
 
