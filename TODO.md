@@ -29,4 +29,6 @@
 
 ## Post-1.0
 
-- DNS-rebinding pinning (documented limitation for 1.0)
+- [x] DNS-rebinding pinning
+- [ ] Coverage reporting and thresholds
+- [ ] Parser fuzzing

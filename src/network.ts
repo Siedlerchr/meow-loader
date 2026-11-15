@@ -1,5 +1,8 @@
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
+import type { LookupFunction } from 'node:net';
+import { Agent, fetch as undiciFetch } from 'undici';
+import type { RequestInit as UndiciRequestInit } from 'undici';
 import { formatBytes } from './display';
 import { applyUserHeaders, buildBaseHeaders } from './headers';
 import { normalizeOrigin, redactUrl } from './url';
@@ -7,8 +10,13 @@ import { normalizeOrigin, redactUrl } from './url';
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 const DNS_TIMEOUT_MS = 5_000;
+const DEFAULT_DNS_CACHE_TTL_MS = 30_000;
 const MAX_RESOLVED_HOSTS = 1_000;
 const MAX_HEADER_WARNINGS = 20;
+
+export type DnsLookup = (hostname: string) => Promise<Array<{ address: string; family: number }>>;
+
+const defaultDnsLookup: DnsLookup = hostname => lookup(hostname, { all: true, verbatim: true });
 
 export interface NetworkPolicyOptions {
   playlistUrl: string;
@@ -18,6 +26,10 @@ export interface NetworkPolicyOptions {
   allowInsecure?: boolean;
   timeoutMs?: number;
   maxRedirects?: number;
+  /** Test hook: override DNS resolution. */
+  dnsLookup?: DnsLookup;
+  /** How long validated addresses stay pinned. */
+  dnsCacheTtlMs?: number;
 }
 
 export interface FetchOptions {
@@ -42,7 +54,11 @@ export class NetworkClient {
   private readonly allowInsecure: boolean;
   private readonly timeoutMs: number;
   private readonly maxRedirects: number;
-  private readonly dnsCache = new Map<string, string[]>();
+  private readonly dnsLookup: DnsLookup;
+  private readonly dnsCacheTtlMs: number;
+  private readonly dnsCache = new Map<string, { addresses: string[]; expiresAt: number }>();
+  private readonly pinnedAddresses = new Map<string, string[]>();
+  private readonly dispatcher: Agent;
   private readonly warnedHeaderOrigins = new Set<string>();
 
   constructor(options: NetworkPolicyOptions) {
@@ -62,6 +78,33 @@ export class NetworkClient {
     this.allowInsecure = options.allowInsecure ?? false;
     this.timeoutMs = options.timeoutMs ?? 120_000;
     this.maxRedirects = options.maxRedirects ?? 10;
+    this.dnsLookup = options.dnsLookup ?? defaultDnsLookup;
+    this.dnsCacheTtlMs = options.dnsCacheTtlMs ?? DEFAULT_DNS_CACHE_TTL_MS;
+
+    const pinnedLookup: LookupFunction = (hostname, lookupOptions, callback) => {
+      const addresses = this.pinnedAddresses.get(normalizeHostname(hostname));
+      if (!addresses || addresses.length === 0) {
+        callback(new Error(`No pinned DNS address for ${hostname}`), '', 0);
+        return;
+      }
+
+      if (lookupOptions.all) {
+        callback(
+          null,
+          addresses.map(address => ({ address, family: isIP(address) })),
+        );
+        return;
+      }
+
+      const address = addresses[0]!;
+      callback(null, address, isIP(address));
+    };
+
+    this.dispatcher = new Agent({
+      keepAliveTimeout: 1_000,
+      keepAliveMaxTimeout: 1_000,
+      connect: { lookup: pinnedLookup },
+    });
 
     for (const origin of options.headerOrigins || []) {
       try {
@@ -70,6 +113,10 @@ export class NetworkClient {
         throw new Error(`Invalid --header-origin: ${origin}`);
       }
     }
+  }
+
+  async close(): Promise<void> {
+    await this.dispatcher.close();
   }
 
   async fetch(url: string, init: RequestInit = {}, options: FetchOptions = {}): Promise<Response> {
@@ -138,13 +185,15 @@ export class NetworkClient {
 
       let response: Response;
       try {
-        response = await fetch(current, {
-          ...init,
+        response = (await undiciFetch(current, {
+          ...(init as UndiciRequestInit),
           headers,
           redirect: 'manual',
           signal,
-        });
+          dispatcher: this.dispatcher,
+        } as unknown as UndiciRequestInit)) as unknown as Response;
       } catch (error) {
+        this.invalidateHost(current.hostname);
         throw new Error(
           `Request failed for ${label} ${redactUrl(current.href)}: ${errorMessage(error)}`,
         );
@@ -209,41 +258,62 @@ export class NetworkClient {
       );
     }
 
-    if (this.allowPrivateNetwork) {
-      return;
-    }
-
     const addresses = await this.resolveAddresses(url.hostname, label);
-    for (const address of addresses) {
-      if (isPrivateAddress(address)) {
-        throw new UrlPolicyError(
-          `Refusing ${label} URL on a loopback/private network address (${address}): ${redactUrl(url.href)}. Use --allow-private-network to permit it.`,
-        );
+    if (!this.allowPrivateNetwork) {
+      for (const address of addresses) {
+        if (isPrivateAddress(address)) {
+          throw new UrlPolicyError(
+            `Refusing ${label} URL on a loopback/private network address (${address}): ${redactUrl(url.href)}. Use --allow-private-network to permit it.`,
+          );
+        }
       }
     }
+
+    const key = normalizeHostname(url.hostname);
+    if (!this.pinnedAddresses.has(key) && this.pinnedAddresses.size >= MAX_RESOLVED_HOSTS) {
+      const oldest = this.pinnedAddresses.keys().next().value;
+      if (oldest !== undefined) {
+        this.pinnedAddresses.delete(oldest);
+      }
+    }
+    this.pinnedAddresses.set(key, addresses);
+  }
+
+  private invalidateHost(hostname: string): void {
+    const host = normalizeHostname(hostname);
+    this.dnsCache.delete(host);
+    this.pinnedAddresses.delete(host);
   }
 
   private async resolveAddresses(hostname: string, label: string): Promise<string[]> {
-    const host = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+    const host = normalizeHostname(hostname);
 
     if (isIP(host)) {
       return [host];
     }
 
     const cached = this.dnsCache.get(host);
-    if (cached) {
-      return cached;
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.addresses;
     }
 
     if (this.dnsCache.size >= MAX_RESOLVED_HOSTS) {
-      throw new Error(`Too many unique ${label} hosts (limit ${MAX_RESOLVED_HOSTS})`);
+      const now = Date.now();
+      for (const [key, entry] of this.dnsCache) {
+        if (entry.expiresAt <= now) {
+          this.dnsCache.delete(key);
+        }
+      }
+      if (this.dnsCache.size >= MAX_RESOLVED_HOSTS) {
+        throw new Error(`Too many unique ${label} hosts (limit ${MAX_RESOLVED_HOSTS})`);
+      }
     }
 
     let records: Array<{ address: string; family: number }>;
     let timer: NodeJS.Timeout | undefined;
     try {
       records = await Promise.race([
-        lookup(host, { all: true, verbatim: true }),
+        this.dnsLookup(host),
         new Promise<never>((_, reject) => {
           timer = setTimeout(
             () => reject(new Error(`DNS lookup timed out for ${host}`)),
@@ -262,9 +332,18 @@ export class NetworkClient {
       throw new Error(`Failed to resolve ${label} host ${host}`);
     }
 
-    this.dnsCache.set(host, addresses);
+    this.dnsCache.set(host, {
+      addresses,
+      expiresAt: Date.now() + this.dnsCacheTtlMs,
+    });
     return addresses;
   }
+}
+
+function normalizeHostname(hostname: string): string {
+  const host =
+    hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+  return host.toLowerCase().replace(/\.$/, '');
 }
 
 export async function readResponseBytes(

@@ -918,13 +918,13 @@ async function saveSubtitleSidecar(options: {
     console.log(`Subtitle file appeared; saving to: ${target.path}`);
   }
 
-  const tempPath = join(parsed.dir, `.meow-subtitles-${process.pid}-${Date.now()}.tmp`);
+  const tempDir = await mkdtemp(join(parsed.dir, '.meow-subtitles-'));
+  const tempPath = join(tempDir, 'subtitles.vtt');
   try {
-    await writeFile(tempPath, merged, { mode: 0o600 });
-    await rename(tempPath, target.path);
-  } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => {});
-    throw error;
+    await writeFile(tempPath, merged, { mode: 0o600, flag: 'wx' });
+    await replaceFile(tempPath, target.path);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 
   console.log(`Subtitles saved to: ${target.path}`);

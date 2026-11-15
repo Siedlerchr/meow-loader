@@ -27,7 +27,7 @@ Despite the name, this is a command-line HLS downloader, not a webpack loader.
   <img src="https://raw.githubusercontent.com/amoshydra/meow-loader/main/assets/demo.svg" alt="Animated meow-loader demo: selecting a variant, audio and subtitles, downloading segments in parallel, and saving an MP4 with a WebVTT sidecar" width="860" />
 </div>
 
-**Jump to:** [Usage](#usage) · [Features](#features) · [Input support](#supported-inputs) · [Limitations](#limitations) · [Troubleshooting](#troubleshooting) · [Releases](https://github.com/amoshydra/meow-loader/releases) · [Changelog](CHANGELOG.md)
+**Jump to:** [Usage](#usage) · [Features](#features) · [Input support](#supported-inputs) · [Limitations](#limitations) · [Security](#security) · [Troubleshooting](#troubleshooting) · [Releases](https://github.com/amoshydra/meow-loader/releases) · [Changelog](CHANGELOG.md)
 
 ## What you get
 
@@ -397,7 +397,7 @@ playlists require a server or CDN that honors `Range` requests.
 - Resume interrupted downloads without treating partial files as complete
 - Optional parallel segment downloads with shared limits (`--concurrency`)
 - Configurable retries, timeouts, and interruption cleanup
-- Per-origin header scoping, SSRF protection, and request timeouts
+- DNS-pinned SSRF protection, per-origin header scoping, and request timeouts
 
 ## Limitations
 
@@ -411,12 +411,19 @@ playlists require a server or CDN that honors `Range` requests.
 - Byte-range and encrypted subtitle segments are not supported.
 - ffmpeg and ffprobe parse untrusted media. Keep them updated; use a sandbox or
   container if you need stronger isolation.
-- SSRF protection resolves hostnames and blocks private ranges before requests.
-  DNS rebinding is not fully preventable in-process; use a sandbox for hostile
-  manifests.
+- SSRF protection resolves and validates addresses and pins connections to
+  them; redirect targets are validated separately. A malicious local DNS
+  resolver can still lie about addresses, so use a sandbox for hostile input.
 
 Unsupported inputs fail with a clear error instead of producing a corrupt
 output file.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the threat model, private vulnerability
+reporting, and hardening guidance. The largest residual risk is
+`ffmpeg`/`ffprobe` parsing untrusted media; keep them updated and use a sandbox
+for hostile input.
 
 ## Development
 

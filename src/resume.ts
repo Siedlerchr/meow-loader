@@ -242,7 +242,10 @@ export async function saveResumeMetadata(
   const metadataPath = join(dir, RESUME_METADATA_FILENAME);
   const temporaryPath = join(tempDir, `${RESUME_METADATA_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
 
-  await writeFile(temporaryPath, `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 });
+  await writeFile(temporaryPath, `${JSON.stringify(metadata, null, 2)}\n`, {
+    mode: 0o600,
+    flag: 'wx',
+  });
   await rename(temporaryPath, metadataPath);
 }
 

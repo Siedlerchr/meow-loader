@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { existsSync } from 'node:fs';
-import { copyFile, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -1263,6 +1263,20 @@ media/all.mp4
     expect(content.match(/WEBVTT/g)).toHaveLength(1);
     expect(content).toContain('Hello from segment one');
     expect(content).toContain('Done');
+  });
+
+  it.skipIf(process.platform === 'win32')('does not write through a subtitle symlink', async () => {
+    const victim = join(tempRoot, 'subtitle-victim.txt');
+    await writeFile(victim, 'ORIGINAL');
+    const output = join(tempRoot, 'subtitle-symlink.mp4');
+    const sidecar = join(tempRoot, 'subtitle-symlink.en.vtt');
+    await symlink(victim, sidecar);
+
+    const { stdout } = await command([`${baseUrl}/subtitle-master.m3u8`, output, '--force']);
+
+    expect(stdout).toContain('Subtitles saved to:');
+    expect(await readFile(victim, 'utf8')).toBe('ORIGINAL');
+    expect(await readFile(sidecar, 'utf8')).toContain('Hello from segment one');
   });
 
   it('selects a subtitle rendition by index', async () => {
