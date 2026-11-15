@@ -208,6 +208,41 @@ If you redirect output to a file or run in CI, that captured output becomes a
 log. URLs are redacted in logs and errors, and terminal control characters from
 manifest-controlled strings are escaped.
 
+## Troubleshooting
+
+**`Output file already exists` after the download finished.** Another process
+created the target filename while segments were downloading. Current versions
+save to `output-1.mp4` (or the next free name) automatically; if you are on an
+older version, the segments are still in the printed `Working dir:` — re-run
+with `--resume <dir>` and a different output name, or with `--force`.
+
+**The playlist endpoint is gone.** If the working directory still contains
+`meow-loader.resume.json` and `segment_*.ts`, merge it without any network
+access:
+
+```bash
+npx meow-loader --merge-only /tmp/meow-abc123 recovered.mp4
+```
+
+Every recorded segment is verified by size and SHA-256; the merge is refused if
+any are missing or corrupt.
+
+**The download stopped part-way.** Re-run with the same playlist URL and
+`--resume <dir>`; completed segments are validated and skipped. The resume
+directory must still match the playlist.
+
+**A CDN or key host returns 401/403.** Custom headers are scoped to the
+playlist origin. Add `--header-origin https://cdn.example.com` for each host
+that needs them.
+
+**`Invalid M3U8 file: missing #EXTM3U header` / an HTML page error.** The URL is
+a web page, not a playlist. In the browser Network tab, copy the `.m3u8`
+request (or its cURL) instead of the page.
+
+**`Refusing ... private network address`.** Loopback and LAN URLs require
+`--allow-private-network`; HTTPS playlists that reference HTTP resources also
+need `--allow-insecure`.
+
 ## Features
 
 - Parse master and media M3U8 playlists
