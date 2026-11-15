@@ -24,6 +24,8 @@ export interface ResumeMetadata {
   segmentCount: number;
   segmentFingerprint: string;
   segments: Record<string, ResumeSegment>;
+  /** Optional for directories created before this field existed. */
+  durationSeconds?: number;
 }
 
 export interface ResumeState {
@@ -58,6 +60,35 @@ export async function initializeResumeState(options: {
   await saveResumeMetadata(options.dir, expected, options.tempDir);
 
   return { metadata: expected, completed, persist: true };
+}
+
+export interface LoadedResumeState {
+  metadata: ResumeMetadata;
+  completed: Set<number>;
+}
+
+/**
+ * Load and validate a resume directory without a playlist. Used by
+ * --merge-only when the original endpoint is no longer available.
+ */
+export async function loadResumeState(dir: string): Promise<LoadedResumeState> {
+  const metadataPath = join(dir, RESUME_METADATA_FILENAME);
+  let raw: string;
+
+  try {
+    raw = await readFile(metadataPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(
+        `No ${RESUME_METADATA_FILENAME} found in ${dir}. Use --resume <dir> with the original playlist instead.`,
+      );
+    }
+    throw error;
+  }
+
+  const metadata = parseMetadata(raw, metadataPath);
+  const completed = await validateCompletedSegments(dir, metadata);
+  return { metadata, completed };
 }
 
 export function recordSegment(
@@ -105,6 +136,7 @@ function createMetadata(
     segmentCount: segments.length,
     segmentFingerprint: fingerprintSegments(segments),
     segments: {},
+    durationSeconds: segments.reduce((sum, segment) => sum + segment.duration, 0),
   };
 }
 
@@ -134,6 +166,15 @@ function parseMetadata(raw: string, path: string): ResumeMetadata {
     !candidate.segments ||
     typeof candidate.segments !== 'object' ||
     Array.isArray(candidate.segments)
+  ) {
+    throw invalidMetadataError(path);
+  }
+
+  if (
+    candidate.durationSeconds !== undefined &&
+    (typeof candidate.durationSeconds !== 'number' ||
+      !Number.isFinite(candidate.durationSeconds) ||
+      candidate.durationSeconds < 0)
   ) {
     throw invalidMetadataError(path);
   }

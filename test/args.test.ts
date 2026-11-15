@@ -43,6 +43,20 @@ describe('parseArgs', () => {
     expect(args.force).toBe(true);
   });
 
+  it('parses --merge-only with an output file', () => {
+    const args = parseArgs(['node', 'meow-loader', '--merge-only', '/tmp/meow', 'out.mp4']);
+
+    expect(args.mergeDir).toBe('/tmp/meow');
+    expect(args.positionals).toEqual(['out.mp4']);
+    expect(args.resumeDir).toBeUndefined();
+  });
+
+  it('rejects --merge-only without a directory', () => {
+    expect(() => parseArgs(['node', 'meow-loader', '--merge-only'])).toThrow(
+      '--merge-only requires a directory path',
+    );
+  });
+
   it('parses security and large-file options', () => {
     const args = parseArgs([
       'node',

@@ -52,6 +52,9 @@ npx meow-loader https://example.com/master.m3u8 --dry-run
 # Keep partial downloads and resume later
 npx meow-loader https://example.com/stream.m3u8 --resume /tmp/meow-abc123
 
+# Merge a saved working dir without contacting the playlist endpoint
+npx meow-loader --merge-only /tmp/meow-abc123 recovered.mp4
+
 # Resume, then remove the downloaded segments after a successful merge
 npx meow-loader https://example.com/stream.m3u8 --resume /tmp/meow-abc123 --cleanup
 
@@ -176,6 +179,18 @@ the working directory printed during the run (`Working dir: ...`), so
 `--resume <dir>` validates them and merges again without downloading. The same
 playlist URL is re-fetched and checked; if it has changed, the resume is
 rejected.
+
+If the playlist endpoint is gone entirely, merge the saved directory offline:
+
+```bash
+npx meow-loader --merge-only /tmp/meow-abc123 recovered.mp4
+```
+
+This reads `meow-loader.resume.json`, verifies every recorded segment against
+its size and SHA-256, and refuses to merge if any segment is missing or
+corrupt. `--cleanup` removes the segments after a successful merge. Resume
+directories created by older versions do not record the playlist duration, so
+for those only the presence of streams and a readable duration is checked.
 
 Resume metadata is written atomically with mode `0600` and contains hashed
 playlist identities plus per-segment SHA-256 hashes. It does not store raw

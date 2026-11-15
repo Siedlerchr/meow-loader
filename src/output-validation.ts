@@ -15,8 +15,8 @@ interface FfprobeOutput {
  * sum of the playlist segment durations. This catches ffmpeg exiting 0 after
  * silently dropping a corrupt segment.
  */
-export async function validateMp4Output(outputPath: string, expectedDuration: number): Promise<void> {
-  if (!Number.isFinite(expectedDuration) || expectedDuration < 0) {
+export async function validateMp4Output(outputPath: string, expectedDuration?: number): Promise<void> {
+  if (expectedDuration !== undefined && (!Number.isFinite(expectedDuration) || expectedDuration < 0)) {
     throw new Error(`Invalid expected duration: ${expectedDuration}`);
   }
 
@@ -56,6 +56,12 @@ export async function validateMp4Output(outputPath: string, expectedDuration: nu
   const actualDuration = Number(info.format?.duration);
   if (!Number.isFinite(actualDuration) || actualDuration <= 0) {
     throw new Error('Merged output has no readable duration');
+  }
+
+  // Resume directories created before durationSeconds was recorded cannot be
+  // checked against the playlist duration, so only require a readable output.
+  if (expectedDuration === undefined) {
+    return;
   }
 
   const tolerance = Math.max(2, expectedDuration * 0.02);

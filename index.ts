@@ -18,6 +18,7 @@ import { validateMp4Output } from './src/output-validation';
 import {
   cleanupResumeState,
   initializeResumeState,
+  loadResumeState,
   recordSegment,
   saveResumeMetadata,
 } from './src/resume';
@@ -32,6 +33,7 @@ import { constants, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
+import type { ParsedArgs } from './src/args';
 
 const execFileAsync = promisify(execFile);
 const MAX_ATTEMPTS = 3;
@@ -485,6 +487,112 @@ function estimateBytes(bandwidth: number, duration: number): number | undefined 
   return Number.isFinite(estimate) ? estimate : undefined;
 }
 
+/**
+ * Merge a saved working directory without contacting the playlist endpoint.
+ * Used when the download finished but the merge failed, or when the endpoint
+ * has gone away.
+ */
+async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Promise<void> {
+  const [outputArg, ...extra] = args.positionals;
+  if (extra.length > 0) {
+    throw new Error(`Unexpected argument: ${sanitizeForDisplay(extra[0]!, 80)}`);
+  }
+
+  const dir = await realpath(resolve(mergeDir)).catch(() => undefined);
+  if (!dir) {
+    throw new Error(`Merge directory does not exist: ${mergeDir}`);
+  }
+
+  const info = await lstat(dir).catch(() => undefined);
+  if (!info?.isDirectory()) {
+    throw new Error(`Merge path is not a directory: ${dir}`);
+  }
+
+  console.log(`Validating segments in: ${dir}`);
+  const { metadata, completed } = await loadResumeState(dir);
+  if (metadata.segmentCount === 0) {
+    throw new Error(`No segments recorded in ${dir}`);
+  }
+
+  const missing: number[] = [];
+  for (let index = 0; index < metadata.segmentCount; index++) {
+    if (!completed.has(index)) {
+      missing.push(index);
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `Cannot merge ${dir}: ${missing.length} of ${metadata.segmentCount} segments are missing or corrupt (first missing index: ${missing[0]}). Re-download with --resume ${dir} when the endpoint is available.`,
+    );
+  }
+
+  const segmentPaths: string[] = [];
+  let totalBytes = 0;
+  for (let index = 0; index < metadata.segmentCount; index++) {
+    const segment = metadata.segments[String(index)]!;
+    segmentPaths.push(join(dir, segment.fileName));
+    totalBytes += segment.size;
+  }
+
+  if (args.dryRun) {
+    console.log(`Segments: ${metadata.segmentCount}`);
+    if (metadata.durationSeconds !== undefined) {
+      console.log(`Duration: ${formatDuration(metadata.durationSeconds)}`);
+    }
+    console.log(`Total size: ${formatBytes(totalBytes)}`);
+    return;
+  }
+
+  await checkFfmpeg();
+  const output = await resolveOutputPath(outputArg, args.force);
+  await ensureFreeSpace(
+    dirname(output),
+    totalBytes + Math.max(FREE_SPACE_MARGIN, totalBytes * 0.05),
+    'merge',
+  );
+
+  let outputTempDir: string | undefined = await mkdtemp(join(dirname(output), '.meow-loader-'));
+  const partialOutput = join(outputTempDir, basename(output));
+
+  process.once('SIGINT', () => {
+    abortActiveMerge();
+    if (outputTempDir) {
+      rmSync(outputTempDir, { recursive: true, force: true });
+    }
+    console.error(`\nInterrupted. Segments preserved at: ${dir}`);
+    process.exit(130);
+  });
+
+  console.log(`Merging ${formatBytes(totalBytes)} from ${metadata.segmentCount} segments...`);
+  try {
+    await mergeToMp4(segmentPaths, partialOutput);
+    console.log('Verifying output...');
+    await validateMp4Output(partialOutput, metadata.durationSeconds);
+    await assertOutputAvailable(output, args.force);
+    await replaceFile(partialOutput, output);
+  } catch (error) {
+    throw new Error(
+      `Failed to finalize output: ${errorMessage(error)}\nSegments preserved at: ${dir}`,
+    );
+  } finally {
+    await rm(outputTempDir, { recursive: true, force: true }).catch(() => {});
+    outputTempDir = undefined;
+  }
+
+  if (args.cleanup) {
+    try {
+      await cleanupResumeState(dir, metadata);
+    } catch (error) {
+      console.warn(`Warning: failed to clean up ${dir}: ${errorMessage(error)}`);
+    }
+  }
+
+  console.log(`Done! Saved to: ${output}`);
+  if (!args.cleanup) {
+    console.log(`Segments kept at: ${dir}`);
+  }
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv);
 
@@ -496,11 +604,19 @@ async function main(): Promise<void> {
     console.log(getVersion());
     return;
   }
-  if (args.cleanup && !args.resumeDir) {
-    throw new Error('--cleanup requires --resume');
+  if (args.cleanup && !args.resumeDir && !args.mergeDir) {
+    throw new Error('--cleanup requires --resume or --merge-only');
+  }
+  if (args.mergeDir && args.resumeDir) {
+    throw new Error('--merge-only cannot be combined with --resume');
   }
   if (args.maxSegmentSize <= 0) {
     throw new Error('--max-segment-size must be greater than 0');
+  }
+
+  if (args.mergeDir) {
+    await mergeDownloadedSegments(args, args.mergeDir);
+    return;
   }
 
   const [url, outputArg, variantArg, ...extra] = args.positionals;

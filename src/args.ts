@@ -15,6 +15,7 @@ export interface ParsedArgs {
   headerOrigins: string[];
   positionals: string[];
   resumeDir: string | undefined;
+  mergeDir: string | undefined;
   force: boolean;
   cleanup: boolean;
   allowPrivateNetwork: boolean;
@@ -33,7 +34,8 @@ Options:
   -H, --header <"Key: Value">    Add a custom HTTP header (repeatable)
   --header-origin <origin>        Send custom headers to this origin too (repeatable)
   --resume <dir>                  Resume a partial download from a saved working dir
-  --cleanup                       Remove downloaded segments from the --resume dir after success
+  --merge-only <dir>              Merge a saved working dir without fetching the playlist
+  --cleanup                       Remove downloaded segments from the --resume/--merge-only dir after success
   --max-download <size>           Maximum total download, e.g. 50GB (0 = unlimited)
   --max-segment-size <size>       Maximum size of one segment, e.g. 1GB
   --allow-private-network         Allow loopback/private-network URLs in manifests
@@ -59,6 +61,7 @@ Examples:
     --header-origin https://cdn.example.com
   meow-loader curl 'https://example.com/video.m3u8' -b 'session=abc123'
   meow-loader https://example.com/video.m3u8 --resume /tmp/meow-abc123
+  meow-loader --merge-only /tmp/meow-abc123 saved.mp4
   meow-loader https://example.com/video.m3u8 --dry-run`;
 
 interface OptionValue {
@@ -128,6 +131,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   const headerOrigins: string[] = [];
   const positionals: string[] = [];
   let resumeDir: string | undefined;
+  let mergeDir: string | undefined;
   let force = false;
   let cleanup = false;
   let allowPrivateNetwork = false;
@@ -284,6 +288,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
       continue;
     }
 
+    const mergeOption = takeValue(argv, i, '--merge-only');
+    if (mergeOption) {
+      if (mergeOption.value === undefined) {
+        throw new Error('--merge-only requires a directory path');
+      }
+      i = mergeOption.next;
+      mergeDir = mergeOption.value;
+      continue;
+    }
+
     if (!endOfOptions && arg === '--resume') {
       const dir = argv[i + 1];
       if (dir === undefined) {
@@ -337,6 +351,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     headerOrigins,
     positionals: curl ? resolveCurlPositionals(positionals, curlUrl, curlOutput) : positionals,
     resumeDir,
+    mergeDir,
     force,
     cleanup,
     allowPrivateNetwork,

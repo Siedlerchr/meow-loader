@@ -418,6 +418,108 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
     expect(segmentRequests).toHaveLength(3);
   });
 
+  it('merges a saved directory with --merge-only', async () => {
+    const resumeDir = join(tempRoot, 'offline-merge');
+    const downloadOutput = join(tempRoot, 'offline-merge-download.mp4');
+    await mkdir(resumeDir, { recursive: true });
+    await command([`${baseUrl}/media.m3u8`, downloadOutput, '--resume', resumeDir]);
+
+    const output = join(tempRoot, 'offline-merge.mp4');
+    segmentRequests = [];
+    const { stdout } = await commandBare(['--merge-only', resumeDir, output]);
+
+    expect(stdout).toContain('Done! Saved to');
+    expect(segmentRequests).toHaveLength(0);
+    expect((await readFile(output)).byteLength).toBeGreaterThan(0);
+    const metadata = JSON.parse(
+      await readFile(join(resumeDir, 'meow-loader.resume.json'), 'utf8'),
+    ) as { durationSeconds?: number };
+    expect(metadata.durationSeconds).toBeCloseTo(30);
+    expect((await readdir(resumeDir)).some(file => /^segment_\d+\.ts$/.test(file))).toBe(true);
+  });
+
+  it('merges directories from older versions without a recorded duration', async () => {
+    const resumeDir = join(tempRoot, 'offline-legacy');
+    await mkdir(resumeDir, { recursive: true });
+    await command([
+      `${baseUrl}/media.m3u8`,
+      join(tempRoot, 'offline-legacy-download.mp4'),
+      '--resume',
+      resumeDir,
+    ]);
+
+    const metadataPath = join(resumeDir, 'meow-loader.resume.json');
+    const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as Record<string, unknown>;
+    delete metadata.durationSeconds;
+    await writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
+
+    const output = join(tempRoot, 'offline-legacy.mp4');
+    const { stdout } = await commandBare(['--merge-only', resumeDir, output]);
+
+    expect(stdout).toContain('Done! Saved to');
+    expect((await readFile(output)).byteLength).toBeGreaterThan(0);
+  });
+
+  it('removes segments with --merge-only --cleanup', async () => {
+    const resumeDir = join(tempRoot, 'offline-cleanup');
+    await mkdir(resumeDir, { recursive: true });
+    await command([
+      `${baseUrl}/media.m3u8`,
+      join(tempRoot, 'offline-cleanup-download.mp4'),
+      '--resume',
+      resumeDir,
+    ]);
+
+    await commandBare([
+      '--merge-only',
+      resumeDir,
+      join(tempRoot, 'offline-cleanup.mp4'),
+      '--cleanup',
+    ]);
+
+    const files = await readdir(resumeDir);
+    expect(files.filter(file => /^segment_\d+\.ts$/.test(file))).toHaveLength(0);
+    expect(files).not.toContain('meow-loader.resume.json');
+  });
+
+  it('refuses to merge a saved directory with missing segments', async () => {
+    const resumeDir = join(tempRoot, 'offline-missing');
+    await mkdir(resumeDir, { recursive: true });
+    await command([
+      `${baseUrl}/media.m3u8`,
+      join(tempRoot, 'offline-missing-download.mp4'),
+      '--resume',
+      resumeDir,
+    ]);
+
+    const files = await readdir(resumeDir);
+    const segment = files.find(file => /^segment_\d+\.ts$/.test(file))!;
+    await rm(join(resumeDir, segment));
+
+    const error = await commandBare([
+      '--merge-only',
+      resumeDir,
+      join(tempRoot, 'offline-missing.mp4'),
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('segments are missing or corrupt');
+  });
+
+  it('requires resume metadata for --merge-only', async () => {
+    const emptyDir = join(tempRoot, 'offline-no-metadata');
+    await mkdir(emptyDir, { recursive: true });
+
+    const error = await commandBare([
+      '--merge-only',
+      emptyDir,
+      join(tempRoot, 'offline-no-metadata.mp4'),
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('meow-loader.resume.json');
+  });
+
   it('resumes without deleting unrelated files in the resume directory', async () => {
     const resumeDir = join(tempRoot, 'resume-keep');
     const output = join(tempRoot, 'resume.mp4');
