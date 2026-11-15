@@ -23,6 +23,19 @@ Despite the name, this is a command-line HLS downloader, not a webpack loader.
   <img src="https://raw.githubusercontent.com/amoshydra/meow-loader/main/assets/demo.svg" alt="Animated meow-loader demo: selecting a variant, audio and subtitles, downloading segments in parallel, and saving an MP4 with a WebVTT sidecar" width="860" />
 </div>
 
+**Jump to:** [Usage](#usage) · [Features](#features) · [Input support](#supported-inputs) · [Limitations](#limitations) · [Troubleshooting](#troubleshooting) · [Releases](https://github.com/amoshydra/meow-loader/releases) · [Changelog](CHANGELOG.md)
+
+## What you get
+
+- **MPEG-TS and fMP4/CMAF** segments, with byte-range (`#EXT-X-BYTERANGE`) and AES-128 support
+- **Separate audio tracks** selected by index or language, muxed into the MP4
+- **Sidecar WebVTT subtitles** written next to the video
+- **Resumable downloads** with per-segment SHA-256 checks, plus offline `--merge-only`
+- **Paste a browser "Copy as cURL"** command and keep its headers and cookies
+- **Parallel segment downloads** (`--concurrency`) with shared size limits
+- **No re-encode**: streams are remuxed with ffmpeg `-c copy`
+- **One CLI on Linux, macOS, and Windows**, with Node.js 22+ and ffmpeg
+
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 22 or newer
@@ -84,6 +97,21 @@ npx meow-loader https://example.com/stream.m3u8 my-video.mp4 --force
 
 # Paste a browser "Copy as cURL" command directly
 npx meow-loader curl 'https://example.com/stream.m3u8' -H 'Pragma: no-cache'
+```
+
+`--dry-run` inspects the playlist without downloading:
+
+```text
+$ npx meow-loader https://example.com/master.m3u8 --dry-run
+Fetching playlist: https://example.com/master.m3u8
+Selected variant: 1920x1080 @ 5000 kbps
+Fetching variant playlist: https://example.com/1080p.m3u8
+Segments: 1450
+Container: MPEG-TS
+Duration: 1h 12m 23s
+Estimated size: ~2.5 GB (bandwidth-based)
+Download limit: 50.0 GB
+Free space: 94.3 GB
 ```
 
 ### Authenticated downloads
@@ -336,6 +364,19 @@ need `--allow-insecure`.
 the host returned the whole file instead of a partial response. Byte-range
 playlists require a server or CDN that honors `Range` requests.
 
+## Supported inputs
+
+| Input | Supported | Notes |
+|---|:---:|---|
+| MPEG-TS and fMP4/CMAF segments | Yes | fMP4 playlists may use one `#EXT-X-MAP` init segment; changing it mid-playlist is unsupported |
+| Byte-range (`#EXT-X-BYTERANGE`) | Yes | The server or CDN must honor `Range` requests |
+| AES-128 encryption | Yes | Includes key rotation and default IVs |
+| Separate audio renditions | Yes | `--audio` or `--audio-language`; muxed into the MP4 |
+| Subtitles | Yes (sidecar) | `--subtitle`; plain WebVTT only, not muxed; byte-range and encrypted subtitle segments are unsupported |
+| Live playlists | No | `#EXT-X-ENDLIST` is required |
+| DRM / SAMPLE-AES | No | Widevine, FairPlay, `SAMPLE-AES`, and `SAMPLE-AES-CTR` are unsupported |
+| MP4 output | Yes | Remuxed with ffmpeg `-c copy`; codecs must be MP4-compatible |
+
 ## Features
 
 - Parse master and media M3U8 playlists
@@ -395,6 +436,8 @@ Run the CLI from the local build:
 ```bash
 node dist/index.mjs <m3u8-url>
 ```
+
+Version history lives in [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/amoshydra/meow-loader/releases).
 
 ## License
 
