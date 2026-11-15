@@ -120,12 +120,6 @@ function validateMediaPlaylist(playlist: M3U8Playlist): number {
   if (!playlist.hasEndList) {
     throw new Error('Live or incomplete playlists are not supported (missing #EXT-X-ENDLIST)');
   }
-  if (playlist.map?.byterange) {
-    throw new Error('Byte-range #EXT-X-MAP initialization segments are not supported');
-  }
-  if (playlist.hasByteRange) {
-    throw new Error('Byte-range playlists (#EXT-X-BYTERANGE) are not supported');
-  }
   if (!playlist.segments || playlist.segments.length === 0) {
     throw new Error('No segments found in playlist');
   }
@@ -398,7 +392,7 @@ async function downloadSegments(
         return null;
       }
 
-      progress.startSegment(i);
+      progress.startSegment(i, segment.byterange?.length);
       let attempts = 0;
       let downloaded = false;
 

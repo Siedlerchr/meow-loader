@@ -243,6 +243,10 @@ request (or its cURL) instead of the page.
 `--allow-private-network`; HTTPS playlists that reference HTTP resources also
 need `--allow-insecure`.
 
+**`server ignored the HTTP Range request`.** The playlist uses byte ranges, but
+the host returned the whole file instead of a partial response. Byte-range
+playlists require a server or CDN that honors `Range` requests.
+
 ## Features
 
 - Parse master and media M3U8 playlists
@@ -250,6 +254,7 @@ need `--allow-insecure`.
 - Interactive variant selection for master playlists
 - AES-128 encrypted HLS support, including key rotation and default IVs
 - MPEG-TS and fMP4/CMAF segments, including a single `#EXT-X-MAP` init segment
+- Byte-range (`#EXT-X-BYTERANGE`) playlists, including single-file HLS
 - Streamed segment downloads with incremental SHA-256 hashing
 - Segment container validation and ffprobe duration verification before replacing output
 - Resume interrupted downloads without treating partial files as complete
@@ -260,8 +265,6 @@ need `--allow-insecure`.
 
 - DRM-protected streams (Widevine, FairPlay, etc.) are not supported.
 - `SAMPLE-AES` and `SAMPLE-AES-CTR` encryption are not supported.
-- Byte-range playlists using `#EXT-X-BYTERANGE` are not supported.
-- Byte-range `#EXT-X-MAP` initialization segments are not supported.
 - Changing the `#EXT-X-MAP` initialization segment mid-playlist is not supported.
 - Live playlists (missing `#EXT-X-ENDLIST`) are not supported.
 - Variants that reference a separate audio rendition

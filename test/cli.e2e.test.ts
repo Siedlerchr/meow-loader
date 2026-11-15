@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { execFile, spawn, spawnSync } from 'node:child_process';
-import { createServer, type Server } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { existsSync } from 'node:fs';
 import { copyFile, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -15,6 +15,56 @@ const fixtures = join(root, 'test', 'fixtures');
 const hasFfmpeg = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' }).status === 0;
 const hasFfprobe = spawnSync('ffprobe', ['-version'], { stdio: 'ignore' }).status === 0;
 const canRun = hasFfmpeg && hasFfprobe && existsSync(distEntry);
+
+function serveRange(
+  request: IncomingMessage,
+  response: ServerResponse,
+  body: Buffer,
+  contentType: string,
+): void {
+  const header = request.headers.range;
+  if (!header) {
+    response.writeHead(200, {
+      'content-type': contentType,
+      'content-length': String(body.length),
+    });
+    response.end(body);
+    return;
+  }
+
+  const match = /^bytes=(\d+)-(\d+)$/.exec(header);
+  const start = match ? Number(match[1]) : NaN;
+  const end = match ? Math.min(Number(match[2]), body.length - 1) : NaN;
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end) {
+    response.writeHead(416, { 'content-range': `bytes */${body.length}` });
+    response.end();
+    return;
+  }
+
+  const slice = body.subarray(start, end + 1);
+  response.writeHead(206, {
+    'content-type': contentType,
+    'content-range': `bytes ${start}-${end}/${body.length}`,
+    'content-length': String(slice.length),
+  });
+  response.end(slice);
+}
+
+const rangeIgnorePlaylist = `#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+#EXT-X-BYTERANGE:1000@0
+media/all-ignore.ts
+#EXT-X-ENDLIST
+`;
+
+const rangeShortPlaylist = `#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+#EXT-X-BYTERANGE:1000@0
+media/all-short.ts
+#EXT-X-ENDLIST
+`;
 
 const mediaPlaylist = `#EXTM3U
 #EXT-X-TARGETDURATION:10
@@ -107,9 +157,71 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
   let tempRoot: string;
   let segmentRequests: string[] = [];
   let segmentGate: { path: string; started: () => void; released: Promise<void> } | undefined;
+  let rangeRequests: string[] = [];
+  let byteRangePlaylist: string;
+  let fmp4RangePlaylist: string;
+  let tsRangeBody: Buffer;
+  let fmp4RangeBody: Buffer;
 
   beforeAll(async () => {
     tempRoot = await mkdtemp(join(tmpdir(), 'meow-loader-e2e-'));
+
+    const tsBytes = await Promise.all(
+      ['segment_000_red.ts', 'segment_001_blue.ts', 'segment_002_green.ts'].map(name =>
+        readFile(join(fixtures, 'segments', name)),
+      ),
+    );
+    tsRangeBody = Buffer.concat(tsBytes);
+    const tsSize = tsBytes[0]!.length;
+
+    byteRangePlaylist = `#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:10,
+#EXT-X-BYTERANGE:${tsSize}@0
+media/all.ts
+#EXTINF:10,
+#EXT-X-BYTERANGE:${tsSize}
+media/all.ts
+#EXTINF:10,
+#EXT-X-BYTERANGE:${tsSize}
+media/all.ts
+#EXT-X-ENDLIST
+`;
+
+    const fmp4Bytes = await Promise.all(
+      ['init.mp4', 'segment_0.m4s', 'segment_1.m4s', 'segment_2.m4s'].map(name =>
+        readFile(join(fixtures, 'fmp4', name)),
+      ),
+    );
+    fmp4RangeBody = Buffer.concat(fmp4Bytes);
+    const [initBytes, segment0, segment1, segment2] = fmp4Bytes as [
+      Buffer,
+      Buffer,
+      Buffer,
+      Buffer,
+    ];
+    const initSize = initBytes.length;
+    const segment0Offset = initSize;
+    const segment1Offset = segment0Offset + segment0.length;
+    const segment2Offset = segment1Offset + segment1.length;
+
+    fmp4RangePlaylist = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MAP:URI="media/all.mp4",BYTERANGE="${initSize}@0"
+#EXTINF:2.000000,
+#EXT-X-BYTERANGE:${segment0.length}@${segment0Offset}
+media/all.mp4
+#EXTINF:2.000000,
+#EXT-X-BYTERANGE:${segment1.length}@${segment1Offset}
+media/all.mp4
+#EXTINF:2.000000,
+#EXT-X-BYTERANGE:${segment2.length}@${segment2Offset}
+media/all.mp4
+#EXT-X-ENDLIST
+`;
+
     server = createServer(async (request, response) => {
       const pathname = new URL(request.url || '/', 'http://localhost').pathname;
 
@@ -140,6 +252,66 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
       if (pathname === '/fmp4-bad/init.mp4') {
         response.writeHead(200, { 'content-type': 'video/mp4' });
         response.end('<html><body>not an initialization segment</body></html>');
+        return;
+      }
+
+      if (pathname === '/byterange.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(byteRangePlaylist);
+        return;
+      }
+
+      if (pathname === '/fmp4-range.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(fmp4RangePlaylist);
+        return;
+      }
+
+      if (pathname === '/byterange-ignore.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(rangeIgnorePlaylist);
+        return;
+      }
+
+      if (pathname === '/byterange-short.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(rangeShortPlaylist);
+        return;
+      }
+
+      if (pathname === '/media/all.ts') {
+        if (request.headers.range) {
+          rangeRequests.push(request.headers.range);
+        }
+        serveRange(request, response, tsRangeBody, 'video/mp2t');
+        return;
+      }
+
+      if (pathname === '/media/all.mp4') {
+        if (request.headers.range) {
+          rangeRequests.push(request.headers.range);
+        }
+        serveRange(request, response, fmp4RangeBody, 'video/mp4');
+        return;
+      }
+
+      if (pathname === '/media/all-ignore.ts') {
+        response.writeHead(200, {
+          'content-type': 'video/mp2t',
+          'content-length': String(tsRangeBody.length),
+        });
+        response.end(tsRangeBody);
+        return;
+      }
+
+      if (pathname === '/media/all-short.ts') {
+        const slice = tsRangeBody.subarray(0, 100);
+        response.writeHead(206, {
+          'content-type': 'video/mp2t',
+          'content-range': `bytes 0-99/${tsRangeBody.length}`,
+          'content-length': String(slice.length),
+        });
+        response.end(slice);
         return;
       }
 
@@ -741,6 +913,53 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
 
     expect(error.code).toBe(1);
     expect(error.stderr).toContain('not a valid fragmented MP4 file');
+  });
+
+  it('downloads single-file byte-range TS playlists', async () => {
+    rangeRequests = [];
+    const output = join(tempRoot, 'byterange.mp4');
+    const { stdout } = await command([`${baseUrl}/byterange.m3u8`, output]);
+    const size = (await readFile(join(fixtures, 'segments', 'segment_000_red.ts'))).byteLength;
+
+    expect(stdout).toContain('Done! Saved to');
+    expect(rangeRequests).toEqual([
+      `bytes=0-${size - 1}`,
+      `bytes=${size}-${size * 2 - 1}`,
+      `bytes=${size * 2}-${size * 3 - 1}`,
+    ]);
+    expect((await readFile(output)).byteLength).toBeGreaterThan(0);
+  });
+
+  it('downloads fMP4 byte-range playlists with a ranged initialization segment', async () => {
+    rangeRequests = [];
+    const output = join(tempRoot, 'fmp4-range.mp4');
+    const { stdout } = await command([`${baseUrl}/fmp4-range.m3u8`, output]);
+    const initSize = (await readFile(join(fixtures, 'fmp4', 'init.mp4'))).byteLength;
+
+    expect(stdout).toContain('Done! Saved to');
+    expect(rangeRequests).toHaveLength(4);
+    expect(rangeRequests[0]).toBe(`bytes=0-${initSize - 1}`);
+    expect((await readFile(output)).byteLength).toBeGreaterThan(0);
+  });
+
+  it('rejects servers that ignore HTTP Range requests', async () => {
+    const error = await command([
+      `${baseUrl}/byterange-ignore.m3u8`,
+      join(tempRoot, 'range-ignore.mp4'),
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('ignored the HTTP Range request');
+  });
+
+  it('rejects truncated byte-range responses', async () => {
+    const error = await command([
+      `${baseUrl}/byterange-short.m3u8`,
+      join(tempRoot, 'range-short.mp4'),
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('declared 1000 bytes');
   });
 
   it('rejects an HTML response served as a segment', async () => {

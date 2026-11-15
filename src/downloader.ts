@@ -45,6 +45,7 @@ export async function downloadSegmentToFile(
     encryption: segment.encryption,
     iv,
     label: 'segment',
+    byterange: segment.byterange,
   });
 }
 
@@ -69,6 +70,9 @@ export async function downloadInitSegmentToFile(
     iv,
     label: 'initialization segment',
     requireFtyp: true,
+    byterange: map.byterange
+      ? { length: map.byterange.length, offset: map.byterange.offset ?? 0 }
+      : undefined,
   });
 }
 
@@ -77,6 +81,7 @@ interface DownloadFileSpec {
   iv?: Uint8Array;
   label: string;
   requireFtyp?: boolean;
+  byterange?: { length: number; offset: number };
 }
 
 async function downloadFile(
@@ -88,20 +93,42 @@ async function downloadFile(
 ): Promise<DownloadedSegment> {
   const controller = new AbortController();
   const headerTimer = setTimeout(() => controller.abort(), HEADER_TIMEOUT_MS);
+  const byterange = spec.byterange;
+  const rangeHeader = byterange
+    ? `bytes=${byterange.offset}-${byterange.offset + byterange.length - 1}`
+    : undefined;
 
   let response: Response;
   try {
-    response = await options.network.fetch(url, {}, {
-      label: spec.label,
-      signal: controller.signal,
-      timeoutMs: 0,
-    });
+    response = await options.network.fetch(
+      url,
+      rangeHeader ? { headers: { Range: rangeHeader } } : {},
+      {
+        label: spec.label,
+        signal: controller.signal,
+        timeoutMs: 0,
+      },
+    );
   } finally {
     clearTimeout(headerTimer);
   }
 
   if (!response.ok) {
     throw new Error(`Failed to download ${spec.label}: ${redactUrl(url)} (${response.status})`);
+  }
+  if (byterange && response.status !== 206) {
+    // A server that ignores Range returns 200 with the whole resource. Only
+    // accept that when the requested range covers the entire resource.
+    const total = Number(response.headers.get('content-length'));
+    const coversWholeFile =
+      byterange.offset === 0 && Number.isFinite(total) && total === byterange.length;
+
+    if (!coversWholeFile) {
+      await response.body?.cancel();
+      throw new Error(
+        `The ${spec.label} server ignored the HTTP Range request: ${redactUrl(url)} (status ${response.status})`,
+      );
+    }
   }
   if (!response.body) {
     throw new Error(`The ${spec.label} response has no body: ${redactUrl(url)}`);
@@ -151,6 +178,14 @@ async function downloadFile(
       }
 
       hash.update(chunk);
+      if (byterange && size > byterange.length) {
+        callback(
+          new Error(
+            `The ${spec.label} exceeded its declared byte range of ${byterange.length} bytes`,
+          ),
+        );
+        return;
+      }
       if (!validator.update(chunk)) {
         callback(new Error(validityError(spec.label, options.container)));
         return;
@@ -172,6 +207,13 @@ async function downloadFile(
     throw error;
   } finally {
     clearTimeout(inactivityTimer);
+  }
+
+  if (byterange && size !== byterange.length) {
+    await rm(destination, { force: true }).catch(() => {});
+    throw new Error(
+      `The ${spec.label} is ${size} bytes, but #EXT-X-BYTERANGE declared ${byterange.length} bytes`,
+    );
   }
 
   if (!validator.valid) {

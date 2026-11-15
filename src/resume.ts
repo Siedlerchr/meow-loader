@@ -365,6 +365,7 @@ function fingerprintSegments(segments: M3U8Segment[], map: M3U8Map | undefined):
           iv: segment.encryption.iv ?? null,
         }
       : null,
+    ...(segment.byterange ? { byterange: segment.byterange } : {}),
   }));
 
   // Keep the fingerprint of MPEG-TS playlists byte-identical to earlier

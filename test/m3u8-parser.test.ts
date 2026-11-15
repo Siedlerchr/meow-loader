@@ -271,7 +271,7 @@ segment-2.m4s
       );
     });
 
-    it('should flag byte-range playlists', () => {
+    it('parses byte-range playlists', () => {
       const content = `#EXTM3U
 #EXTINF:10,
 #EXT-X-BYTERANGE:1000@0
@@ -281,6 +281,77 @@ segment.ts
       const playlist = parseM3U8(content);
 
       expect(playlist.hasByteRange).toBe(true);
+      expect(playlist.segments![0]!.byterange).toEqual({ length: 1000, offset: 0 });
+    });
+
+    it('resolves implicit byte-range offsets to the next byte of the same resource', () => {
+      const content = `#EXTM3U
+#EXTINF:10,
+#EXT-X-BYTERANGE:1000@0
+segment.ts
+#EXTINF:10,
+#EXT-X-BYTERANGE:1000
+segment.ts
+#EXTINF:10,
+#EXT-X-BYTERANGE:500
+segment.ts
+#EXT-X-ENDLIST
+`;
+      const playlist = parseM3U8(content);
+
+      expect(playlist.segments!.map(segment => segment.byterange)).toEqual([
+        { length: 1000, offset: 0 },
+        { length: 1000, offset: 1000 },
+        { length: 500, offset: 2000 },
+      ]);
+    });
+
+    it('accepts a byte range specified before #EXTINF', () => {
+      const content = `#EXTM3U
+#EXT-X-BYTERANGE:2048@4096
+#EXTINF:10,
+segment.ts
+#EXT-X-ENDLIST
+`;
+      const playlist = parseM3U8(content);
+
+      expect(playlist.segments![0]!.byterange).toEqual({ length: 2048, offset: 4096 });
+    });
+
+    it('rejects an implicit byte range without a previous segment from the same resource', () => {
+      const content = `#EXTM3U
+#EXTINF:10,
+#EXT-X-BYTERANGE:1000
+segment.ts
+#EXT-X-ENDLIST
+`;
+
+      expect(() => parseM3U8(content)).toThrow(
+        '#EXT-X-BYTERANGE without an offset must follow a segment from the same resource',
+      );
+    });
+
+    it('rejects duplicate byte ranges before a segment URI', () => {
+      const content = `#EXTM3U
+#EXTINF:10,
+#EXT-X-BYTERANGE:1000@0
+#EXT-X-BYTERANGE:1000@1000
+segment.ts
+#EXT-X-ENDLIST
+`;
+
+      expect(() => parseM3U8(content)).toThrow('duplicate #EXT-X-BYTERANGE');
+    });
+
+    it('rejects a trailing byte range without a segment URI', () => {
+      const content = `#EXTM3U
+#EXTINF:10,
+segment.ts
+#EXT-X-BYTERANGE:1000@0
+#EXT-X-ENDLIST
+`;
+
+      expect(() => parseM3U8(content)).toThrow('#EXT-X-BYTERANGE without a segment URI');
     });
 
     it('should flag live playlists without an end list', () => {

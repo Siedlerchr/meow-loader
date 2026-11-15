@@ -5,6 +5,8 @@ export interface M3U8Segment {
   /** HLS media sequence number used for the default AES-128 IV. */
   sequence: number;
   encryption?: M3U8Encryption;
+  /** Resolved byte range within the URI. */
+  byterange?: { length: number; offset: number };
 }
 
 export interface M3U8Encryption {
@@ -67,6 +69,7 @@ export function parseM3U8(content: string): M3U8Playlist {
 
   let currentSegment: { duration: number; title?: string } | undefined;
   let currentEncryption: M3U8Encryption | undefined;
+  let pendingByteRange: M3U8ByteRange | undefined;
   let pendingVariantAttrs: Record<string, string | undefined> | undefined;
   let segmentIndex = 0;
 
@@ -182,6 +185,14 @@ export function parseM3U8(content: string): M3U8Playlist {
     }
 
     if (line.startsWith('#EXT-X-BYTERANGE')) {
+      if (pendingByteRange) {
+        throw new Error('Invalid M3U8 file: duplicate #EXT-X-BYTERANGE before a segment URI');
+      }
+      const separator = line.indexOf(':');
+      if (separator === -1) {
+        throw new Error('Invalid #EXT-X-BYTERANGE value');
+      }
+      pendingByteRange = parseByteRange(line.slice(separator + 1));
       playlist.hasByteRange = true;
       continue;
     }
@@ -235,13 +246,19 @@ export function parseM3U8(content: string): M3U8Playlist {
       throw new Error('Invalid M3U8 file: segment URI without #EXTINF');
     }
 
+    const byterange = pendingByteRange
+      ? resolveSegmentByteRange(pendingByteRange, line, playlist.segments!)
+      : undefined;
+
     playlist.segments!.push({
       uri: line,
       duration: currentSegment.duration,
       title: currentSegment.title,
       sequence: playlist.mediaSequence + segmentIndex,
+      ...(byterange ? { byterange } : {}),
       ...(currentEncryption ? { encryption: { ...currentEncryption } } : {}),
     });
+    pendingByteRange = undefined;
     segmentIndex++;
     currentSegment = undefined;
   }
@@ -251,6 +268,9 @@ export function parseM3U8(content: string): M3U8Playlist {
   }
   if (pendingVariantAttrs) {
     throw new Error('Invalid M3U8 file: #EXT-X-STREAM-INF without a URI');
+  }
+  if (pendingByteRange) {
+    throw new Error('Invalid M3U8 file: #EXT-X-BYTERANGE without a segment URI');
   }
 
   return playlist;
@@ -289,6 +309,28 @@ function parseByteRange(value: string): M3U8ByteRange {
 
 function sameMap(a: M3U8Map, b: M3U8Map): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function resolveSegmentByteRange(
+  range: M3U8ByteRange,
+  uri: string,
+  segments: M3U8Segment[],
+): { length: number; offset: number } {
+  if (range.offset !== undefined) {
+    return { length: range.length, offset: range.offset };
+  }
+
+  const previous = segments[segments.length - 1];
+  if (previous?.byterange && previous.uri === uri) {
+    return {
+      length: range.length,
+      offset: previous.byterange.offset + previous.byterange.length,
+    };
+  }
+
+  throw new Error(
+    'Invalid M3U8 file: #EXT-X-BYTERANGE without an offset must follow a segment from the same resource',
+  );
 }
 
 function parseAttributes(str: string): Record<string, string | undefined> {
