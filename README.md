@@ -49,6 +49,12 @@ npx meow-loader https://example.com/master.m3u8 my-video.mp4 1
 # Select an audio rendition by index (master playlists)
 npx meow-loader https://example.com/master.m3u8 my-video.mp4 0 --audio 1
 
+# Select an audio rendition by language or name
+npx meow-loader https://example.com/master.m3u8 my-video.mp4 --audio-language es
+
+# Retry a failed download up to five attempts, with a 60 second timeout
+npx meow-loader https://example.com/stream.m3u8 --retries 5 --timeout 60
+
 # Inspect variants, duration, and estimated size without downloading
 npx meow-loader https://example.com/master.m3u8 --dry-run
 
@@ -122,14 +128,17 @@ Available audio renditions:
   [1] Spanish (es)
 ```
 
-Choose another rendition by index:
+Choose another rendition by index, or by language/name:
 
 ```bash
 npx meow-loader https://example.com/master.m3u8 out.mp4 0 --audio 1
+npx meow-loader https://example.com/master.m3u8 out.mp4 --audio-language es
 ```
 
 Index 0 is the default rendition, followed by `AUTOSELECT` entries and then
-playlist order. With multiple renditions and an interactive terminal, the CLI
+playlist order. `--audio-language` matches BCP-47 language tags (`en`, `en-US`)
+and falls back to the rendition name. `--audio` and `--audio-language` cannot
+be combined. With multiple renditions and an interactive terminal, the CLI
 asks which one to use; non-interactive runs take the default. If the variant's
 audio is already muxed, no listing or separate download happens.
 
@@ -181,6 +190,17 @@ If a limit is reached:
 - The CLI prints the resume command and how to raise the limit.
 
 `--dry-run` prints the selected variant, segment count, duration, estimated size, and free space without downloading.
+
+### Retries, timeouts, and the working directory
+
+`--retries <n>` controls attempts per resource (default 3, range 1-10).
+`--timeout <seconds>` controls the playlist, header, and inactivity timeouts
+(default 120, range 1-3600).
+
+The working directory is created under the operating system temporary
+directory (`os.tmpdir()`, which honours `TMPDIR`). For very large downloads or
+a small temporary filesystem, point `TMPDIR` at a larger disk or use
+`--resume <dir>` to choose the directory explicitly.
 
 ### Concurrency
 
@@ -304,6 +324,7 @@ playlists require a server or CDN that honors `Range` requests.
 - Resume interrupted downloads without treating partial files as complete
 - Merge segments into a single MP4 via ffmpeg
 - Optional parallel segment downloads with shared limits (`--concurrency`)
+- Configurable retries, timeouts, and interruption cleanup
 - Per-origin header scoping, SSRF protection, and request timeouts
 
 ## Limitations

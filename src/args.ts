@@ -11,6 +11,10 @@ export const DEFAULT_PLAYLIST_MAX_BYTES = 16 * 1024 ** 2;
 export const DEFAULT_MAX_SEGMENTS = 100_000;
 export const DEFAULT_CONCURRENCY = 1;
 export const MAX_CONCURRENCY = 16;
+export const DEFAULT_RETRIES = 3;
+export const MAX_RETRIES = 10;
+export const DEFAULT_TIMEOUT_MS = 120_000;
+export const MAX_TIMEOUT_SECONDS = 3600;
 
 export interface ParsedArgs {
   headers: Record<string, string>;
@@ -19,6 +23,9 @@ export interface ParsedArgs {
   resumeDir: string | undefined;
   mergeDir: string | undefined;
   audio: string | undefined;
+  audioLanguage: string | undefined;
+  retries: number;
+  timeoutMs: number;
   force: boolean;
   cleanup: boolean;
   allowPrivateNetwork: boolean;
@@ -38,6 +45,9 @@ Options:
   -H, --header <"Key: Value">    Add a custom HTTP header (repeatable)
   --header-origin <origin>        Send custom headers to this origin too (repeatable)
   --audio <index>                 Select an audio rendition (master playlists)
+  --audio-language <lang>         Select an audio rendition by language or name
+  --retries <n>                   Attempts per download (default: 3)
+  --timeout <seconds>             Network timeout (default: 120)
   --resume <dir>                  Resume a partial download from a saved working dir
   --merge-only <dir>              Merge a saved working dir without fetching the playlist
   --cleanup                       Remove downloaded segments from the --resume/--merge-only dir after success
@@ -140,6 +150,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
   let resumeDir: string | undefined;
   let mergeDir: string | undefined;
   let audio: string | undefined;
+  let audioLanguage: string | undefined;
+  let retries = DEFAULT_RETRIES;
+  let timeoutMs = DEFAULT_TIMEOUT_MS;
   let force = false;
   let cleanup = false;
   let allowPrivateNetwork = false;
@@ -302,8 +315,44 @@ export function parseArgs(argv: string[]): ParsedArgs {
       if (audioOption.value === undefined) {
         throw new Error('--audio requires a rendition index');
       }
+      if (audioLanguage !== undefined) {
+        throw new Error('Use either --audio or --audio-language, not both');
+      }
       i = audioOption.next;
       audio = audioOption.value;
+      continue;
+    }
+
+    const audioLanguageOption = takeValue(argv, i, '--audio-language');
+    if (audioLanguageOption) {
+      if (audioLanguageOption.value === undefined) {
+        throw new Error('--audio-language requires a language or name');
+      }
+      if (audio !== undefined) {
+        throw new Error('Use either --audio or --audio-language, not both');
+      }
+      i = audioLanguageOption.next;
+      audioLanguage = audioLanguageOption.value;
+      continue;
+    }
+
+    const retriesOption = takeValue(argv, i, '--retries');
+    if (retriesOption) {
+      if (retriesOption.value === undefined) {
+        throw new Error('--retries requires a number');
+      }
+      i = retriesOption.next;
+      retries = parseRetries(retriesOption.value);
+      continue;
+    }
+
+    const timeoutOption = takeValue(argv, i, '--timeout');
+    if (timeoutOption) {
+      if (timeoutOption.value === undefined) {
+        throw new Error('--timeout requires a number of seconds');
+      }
+      i = timeoutOption.next;
+      timeoutMs = parseTimeout(timeoutOption.value);
       continue;
     }
 
@@ -382,6 +431,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
     resumeDir,
     mergeDir,
     audio,
+    audioLanguage,
+    retries,
+    timeoutMs,
     force,
     cleanup,
     allowPrivateNetwork,
@@ -424,6 +476,32 @@ function resolveCurlPositionals(
   const variant = curlOutput !== undefined ? rest[0] : rest[1];
 
   return [url, output, variant].filter((value): value is string => value !== undefined);
+}
+
+export function parseRetries(value: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invalid retry count "${value}". Choose 1-${MAX_RETRIES}`);
+  }
+
+  const retries = Number(value);
+  if (!Number.isInteger(retries) || retries < 1 || retries > MAX_RETRIES) {
+    throw new Error(`Invalid retry count. Choose 1-${MAX_RETRIES}`);
+  }
+
+  return retries;
+}
+
+export function parseTimeout(value: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invalid timeout "${value}". Choose 1-${MAX_TIMEOUT_SECONDS} seconds`);
+  }
+
+  const seconds = Number(value);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > MAX_TIMEOUT_SECONDS) {
+    throw new Error(`Invalid timeout. Choose 1-${MAX_TIMEOUT_SECONDS} seconds`);
+  }
+
+  return seconds * 1000;
 }
 
 export function parseConcurrency(value: string): number {

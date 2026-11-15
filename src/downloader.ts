@@ -12,8 +12,7 @@ import { createSegmentValidator } from './segment-validation';
 import type { HlsContainer } from './segment-validation';
 import { redactUrl } from './url';
 
-const HEADER_TIMEOUT_MS = 120_000;
-const INACTIVITY_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_MS = 120_000;
 
 export interface DownloadSegmentOptions {
   network: NetworkClient;
@@ -21,6 +20,8 @@ export interface DownloadSegmentOptions {
   maxBytes: number;
   container: HlsContainer;
   signal?: AbortSignal;
+  timeoutMs?: number;
+  attempts?: number;
   onProgress?: (bytes: number) => void;
 }
 
@@ -93,7 +94,8 @@ async function downloadFile(
   spec: DownloadFileSpec,
 ): Promise<DownloadedSegment> {
   const controller = new AbortController();
-  const headerTimer = setTimeout(() => controller.abort(), HEADER_TIMEOUT_MS);
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const headerTimer = setTimeout(() => controller.abort(), timeoutMs);
   const byterange = spec.byterange;
   const rangeHeader = byterange
     ? `bytes=${byterange.offset}-${byterange.offset + byterange.length - 1}`
@@ -155,10 +157,10 @@ async function downloadFile(
     stream = stream.pipe(createDecipheriv('aes-128-cbc', key, Buffer.from(spec.iv!)));
   }
 
-  let inactivityTimer = setTimeout(() => controller.abort(), INACTIVITY_TIMEOUT_MS);
+  let inactivityTimer = setTimeout(() => controller.abort(), timeoutMs);
   const resetInactivity = () => {
     clearTimeout(inactivityTimer);
-    inactivityTimer = setTimeout(() => controller.abort(), INACTIVITY_TIMEOUT_MS);
+    inactivityTimer = setTimeout(() => controller.abort(), timeoutMs);
   };
 
   const hash = createHash('sha256');
@@ -279,7 +281,10 @@ async function getKey(
     throw new SegmentLimitError('Too many unique encryption keys in this playlist');
   }
 
-  const response = await options.network.fetch(keyUrl, {}, { label: 'encryption key' });
+  const response = await options.network.fetch(keyUrl, {}, {
+    label: 'encryption key',
+    attempts: options.attempts,
+  });
   if (!response.ok) {
     throw new Error(`Failed to download encryption key: ${redactUrl(keyUrl)} (${response.status})`);
   }

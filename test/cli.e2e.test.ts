@@ -75,6 +75,20 @@ av-video.m3u8
 
 const audioMasterLowBandwidth = audioMasterPlaylist.replace('BANDWIDTH=2000000', 'BANDWIDTH=1000');
 
+const flakyPlaylist = `#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+flaky/segment.ts
+#EXT-X-ENDLIST
+`;
+
+const timeoutPlaylist = `#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+timeout/segment.ts
+#EXT-X-ENDLIST
+`;
+
 const slowPlaylist = `#EXTM3U
 #EXT-X-TARGETDURATION:10
 #EXTINF:10,
@@ -195,6 +209,7 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
   let audioRequests: string[] = [];
   let slowInFlight = 0;
   let slowMaxConcurrent = 0;
+  let flakyFailuresRemaining = 0;
   let byteRangePlaylist: string;
   let fmp4RangePlaylist: string;
   let tsRangeBody: Buffer;
@@ -325,6 +340,39 @@ media/all.mp4
           response.writeHead(404);
           response.end('not found');
         }
+        return;
+      }
+
+      if (pathname === '/flaky.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(flakyPlaylist);
+        return;
+      }
+
+      if (pathname === '/flaky/segment.ts') {
+        if (flakyFailuresRemaining > 0) {
+          flakyFailuresRemaining--;
+          response.writeHead(500);
+          response.end('temporary failure');
+          return;
+        }
+        const content = await readFile(join(fixtures, 'segments', 'segment_000_red.ts'));
+        response.writeHead(200, { 'content-type': 'video/mp2t' });
+        response.end(content);
+        return;
+      }
+
+      if (pathname === '/timeout.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(timeoutPlaylist);
+        return;
+      }
+
+      if (pathname === '/timeout/segment.ts') {
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        const content = await readFile(join(fixtures, 'segments', 'segment_000_red.ts'));
+        response.writeHead(200, { 'content-type': 'video/mp2t' });
+        response.end(content);
         return;
       }
 
@@ -1040,6 +1088,83 @@ media/all.mp4
 
     const streams = await ffprobeStreamTypes(output);
     expect(streams).toContain('audio');
+  });
+
+  it('selects an audio rendition by language', async () => {
+    audioRequests = [];
+    const output = join(tempRoot, 'av-spanish-language.mp4');
+    const { stdout } = await command([
+      `${baseUrl}/av-master.m3u8`,
+      output,
+      '--audio-language',
+      'es',
+    ]);
+
+    expect(stdout).toContain('Audio rendition: Spanish (es)');
+    expect(audioRequests.some(url => url.includes('?lang=es'))).toBe(true);
+    expect(audioRequests.some(url => url.includes('?lang=en'))).toBe(false);
+  });
+
+  it('matches an audio rendition by name', async () => {
+    audioRequests = [];
+    const output = join(tempRoot, 'av-spanish-name.mp4');
+    const { stdout } = await command([
+      `${baseUrl}/av-master.m3u8`,
+      output,
+      '--audio-language',
+      'Spanish',
+    ]);
+
+    expect(stdout).toContain('Audio rendition: Spanish (es)');
+    expect(audioRequests.some(url => url.includes('?lang=es'))).toBe(true);
+  });
+
+  it('rejects an unknown audio language', async () => {
+    const error = await command([
+      `${baseUrl}/av-master.m3u8`,
+      join(tempRoot, 'av-unknown-language.mp4'),
+      '--audio-language',
+      'fr',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('No audio rendition matches "fr"');
+  });
+
+  it('retries a failed segment with --retries', async () => {
+    flakyFailuresRemaining = 1;
+    const output = join(tempRoot, 'retry-ok.mp4');
+    const { stdout } = await command([`${baseUrl}/flaky.m3u8`, output, '--retries', '2']);
+
+    expect(stdout).toContain('Done! Saved to');
+    expect((await readFile(output)).byteLength).toBeGreaterThan(0);
+  });
+
+  it('stops after one attempt with --retries 1', async () => {
+    flakyFailuresRemaining = 1;
+    const error = await command([
+      `${baseUrl}/flaky.m3u8`,
+      join(tempRoot, 'retry-fail.mp4'),
+      '--retries',
+      '1',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('Max retries reached');
+  });
+
+  it('aborts requests after --timeout seconds', async () => {
+    const error = await command([
+      `${baseUrl}/timeout.m3u8`,
+      join(tempRoot, 'timeout.mp4'),
+      '--timeout',
+      '1',
+      '--retries',
+      '1',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toMatch(/Request failed|abort/i);
   });
 
   it('rejects an out-of-range audio index', async () => {

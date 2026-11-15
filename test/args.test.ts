@@ -65,6 +65,36 @@ describe('parseArgs', () => {
     );
   });
 
+  it('parses --audio-language, --retries, and --timeout', () => {
+    const args = parseArgs([
+      'node',
+      'meow-loader',
+      'master.m3u8',
+      '--audio-language',
+      'es',
+      '--retries',
+      '5',
+      '--timeout',
+      '30',
+    ]);
+
+    expect(args.audioLanguage).toBe('es');
+    expect(args.retries).toBe(5);
+    expect(args.timeoutMs).toBe(30_000);
+    expect(parseArgs(['node', 'meow-loader', 'master.m3u8']).retries).toBe(3);
+    expect(parseArgs(['node', 'meow-loader', 'master.m3u8']).timeoutMs).toBe(120_000);
+
+    expect(() =>
+      parseArgs(['node', 'meow-loader', 'master.m3u8', '--audio', '1', '--audio-language', 'es']),
+    ).toThrow('not both');
+    expect(() => parseArgs(['node', 'meow-loader', 'master.m3u8', '--retries', '0'])).toThrow(
+      'Invalid retry count',
+    );
+    expect(() => parseArgs(['node', 'meow-loader', 'master.m3u8', '--timeout', '0'])).toThrow(
+      'Invalid timeout',
+    );
+  });
+
   it('parses --concurrency', () => {
     expect(parseArgs(['node', 'meow-loader', 'video.m3u8']).concurrency).toBe(1);
     expect(parseArgs(['node', 'meow-loader', 'video.m3u8', '--concurrency', '4']).concurrency).toBe(4);

@@ -46,7 +46,6 @@ import { createRequire } from 'node:module';
 import type { ParsedArgs } from './src/args';
 
 const execFileAsync = promisify(execFile);
-const MAX_ATTEMPTS = 3;
 const MAX_VARIANTS = 1_000;
 const MAX_EXPECTED_DURATION = 366 * 24 * 60 * 60;
 const FREE_SPACE_MARGIN = 512 * 1024 ** 2;
@@ -138,12 +137,16 @@ async function selectAudioRenditionForGroup(
   media: M3U8Media[] | undefined,
   groupId: string,
   audioArg: string | undefined,
+  languageArg: string | undefined,
 ): Promise<M3U8Media | undefined> {
   const candidates = sortAudioRenditions(media, groupId);
 
   if (candidates.length === 0) {
-    if (audioArg !== undefined) {
-      throw new Error('--audio cannot be used: the selected variant has no separate audio rendition');
+    if (audioArg !== undefined || languageArg !== undefined) {
+      const flag = audioArg !== undefined ? '--audio' : '--audio-language';
+      throw new Error(
+        `${flag} cannot be used: the selected variant has no separate audio rendition`,
+      );
     }
     return undefined;
   }
@@ -165,6 +168,29 @@ async function selectAudioRenditionForGroup(
 
   if (audioArg !== undefined) {
     return candidates[parseAudioIndex(audioArg, candidates.length)]!;
+  }
+
+  if (languageArg !== undefined) {
+    const wanted = languageArg.toLowerCase();
+    const languageMatches = candidates.filter((rendition) => {
+      const language = rendition.language?.toLowerCase();
+      return language === wanted || language?.startsWith(`${wanted}-`);
+    });
+    const nameMatches = candidates.filter(
+      rendition => rendition.name?.toLowerCase() === wanted,
+    );
+    const matches = languageMatches.length > 0 ? languageMatches : nameMatches;
+
+    if (matches.length === 0) {
+      const available = candidates
+        .map(rendition => rendition.language || rendition.name || 'unnamed')
+        .join(', ');
+      throw new Error(
+        `No audio rendition matches "${sanitizeForDisplay(languageArg, 40)}". Available: ${available}`,
+      );
+    }
+
+    return matches.find(rendition => rendition.default) ?? matches[0]!;
   }
 
   if (candidates.length === 1) {
@@ -307,8 +333,8 @@ async function ensureFreeSpace(dir: string, requiredBytes: number, label: string
   }
 }
 
-async function promptRetry(attempts: number): Promise<'retry' | 'save'> {
-  const remaining = Math.max(0, MAX_ATTEMPTS - attempts);
+async function promptRetry(attempts: number, maxAttempts: number): Promise<'retry' | 'save'> {
+  const remaining = Math.max(0, maxAttempts - attempts);
   if (remaining === 0) {
     return 'save';
   }
@@ -370,6 +396,8 @@ interface DownloadTrackOptions {
   persist: boolean;
   budget: DownloadBudget;
   concurrency: number;
+  maxAttempts: number;
+  timeoutMs: number;
 }
 
 interface DownloadedTrack {
@@ -494,6 +522,8 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
           maxBytes: slice,
           container: 'fmp4',
           signal: abortController.signal,
+          timeoutMs: options.timeoutMs,
+          attempts: options.maxAttempts,
         });
 
         await replaceSegmentFile(partialPath, initPath);
@@ -592,6 +622,8 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
           maxBytes: slice,
           container,
           signal: abortController.signal,
+          timeoutMs: options.timeoutMs,
+          attempts: options.maxAttempts,
           onProgress: bytes => {
             if (concurrency > 1) {
               progress.addBytes(bytes - lastBytes);
@@ -650,14 +682,14 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
         console.error(`\nFailed to download ${kindLabel}segment ${index + 1}`);
         console.error(errorMessage(error));
 
-        if (attempts >= MAX_ATTEMPTS) {
+        if (attempts >= options.maxAttempts) {
           console.error(`Max retries reached for ${kindLabel}segment ${index + 1}.`);
           fail(null, false);
           return;
         }
 
         if (concurrency === 1 && stdin.isTTY) {
-          const action = await promptRetry(attempts);
+          const action = await promptRetry(attempts, options.maxAttempts);
           if (action === 'save') {
             console.log(`Partial download saved. Resume later with: --resume ${tmpDir}`);
             process.exitCode = 1;
@@ -757,6 +789,12 @@ async function cleanupWorkingDirectory(
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function registerInterruptHandlers(handler: (signal: NodeJS.Signals) => void): void {
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.once(signal, () => handler(signal));
+  }
 }
 
 function resolveManifestUrl(uri: string, baseUrl: string): string {
@@ -912,13 +950,13 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
   let outputTempDir: string | undefined = await mkdtemp(join(dirname(output), '.meow-loader-'));
   const partialOutput = join(outputTempDir, basename(output));
 
-  process.once('SIGINT', () => {
+  registerInterruptHandlers(signal => {
     abortActiveMerge();
     if (outputTempDir) {
       rmSync(outputTempDir, { recursive: true, force: true });
     }
     console.error(`\nInterrupted. Segments preserved at: ${dir}`);
-    process.exit(130);
+    process.exit(signal === 'SIGINT' ? 130 : 143);
   });
 
   console.log(`Merging ${formatBytes(totalBytes)} from ${metadata.segmentCount} segments...`);
@@ -1003,10 +1041,11 @@ async function main(): Promise<void> {
     headerOrigins: args.headerOrigins,
     allowPrivateNetwork: args.allowPrivateNetwork,
     allowInsecure: args.allowInsecure,
+    timeoutMs: args.timeoutMs,
   });
 
   console.log(`Fetching playlist: ${redactUrl(url)}`);
-  const response = await network.fetch(url, {}, { attempts: 3, label: 'playlist' });
+  const response = await network.fetch(url, {}, { attempts: args.retries, label: 'playlist' });
   if (!response.ok) {
     throw new Error(`Failed to fetch playlist: ${response.status}`);
   }
@@ -1039,12 +1078,14 @@ async function main(): Promise<void> {
         masterPlaylist.media,
         selectedVariant.audioGroup,
         args.audio,
+        args.audioLanguage,
       );
       if (audioRendition) {
         console.log(`Audio rendition: ${formatAudioRendition(audioRendition)}`);
       }
-    } else if (args.audio !== undefined) {
-      throw new Error('--audio requires a master playlist with a separate audio rendition');
+    } else if (args.audio !== undefined || args.audioLanguage !== undefined) {
+      const flag = args.audio !== undefined ? '--audio' : '--audio-language';
+      throw new Error(`${flag} requires a master playlist with a separate audio rendition`);
     }
 
     playlistUrl = resolveManifestUrl(selectedVariant.uri, masterUrl);
@@ -1054,7 +1095,7 @@ async function main(): Promise<void> {
     );
     console.log(`Fetching variant playlist: ${redactUrl(playlistUrl)}`);
 
-    const variantResponse = await network.fetch(playlistUrl, {}, { attempts: 3, label: 'variant playlist' });
+    const variantResponse = await network.fetch(playlistUrl, {}, { attempts: args.retries, label: 'variant playlist' });
     if (!variantResponse.ok) {
       throw new Error(`Failed to fetch variant playlist: ${variantResponse.status}`);
     }
@@ -1065,8 +1106,9 @@ async function main(): Promise<void> {
     playlist = parseM3U8(variantBody);
   } else if (variantArg !== undefined) {
     throw new Error('variant-index can only be used with a master playlist');
-  } else if (args.audio !== undefined) {
-    throw new Error('--audio can only be used with a master playlist');
+  } else if (args.audio !== undefined || args.audioLanguage !== undefined) {
+    const flag = args.audio !== undefined ? '--audio' : '--audio-language';
+    throw new Error(`${flag} can only be used with a master playlist`);
   }
 
   const expectedDuration = validateMediaPlaylist(playlist);
@@ -1085,7 +1127,7 @@ async function main(): Promise<void> {
   if (audioPlaylistUrl) {
     console.log(`Fetching audio playlist: ${redactUrl(audioPlaylistUrl)}`);
     const audioResponse = await network.fetch(audioPlaylistUrl, {}, {
-      attempts: 3,
+      attempts: args.retries,
       label: 'audio playlist',
     });
     if (!audioResponse.ok) {
@@ -1191,14 +1233,14 @@ async function main(): Promise<void> {
 
   let outputTempDir: string | undefined;
 
-  process.once('SIGINT', () => {
+  registerInterruptHandlers(signal => {
     abortActiveMerge();
     rmSync(workDir, { recursive: true, force: true });
     if (outputTempDir) {
       rmSync(outputTempDir, { recursive: true, force: true });
     }
     console.error(`\nInterrupted. Resume later with: --resume ${tmpDir}`);
-    process.exit(130);
+    process.exit(signal === 'SIGINT' ? 130 : 143);
   });
 
   const keyCache = new Map<string, Buffer>();
@@ -1226,6 +1268,8 @@ async function main(): Promise<void> {
     persist: true,
     budget,
     concurrency: args.concurrency,
+    maxAttempts: args.retries,
+    timeoutMs: args.timeoutMs,
   });
   if (!videoResult) {
     return;
@@ -1253,6 +1297,8 @@ async function main(): Promise<void> {
       persist: true,
       budget,
       concurrency: args.concurrency,
+      maxAttempts: args.retries,
+      timeoutMs: args.timeoutMs,
     });
     if (!result) {
       return;
