@@ -1,8 +1,14 @@
 #!/usr/bin/env node
-import { parseM3U8, sortVariantsByBandwidth } from './src/m3u8-parser';
-import type { M3U8Map, M3U8Playlist, M3U8Segment, M3U8Variant } from './src/m3u8-parser';
+import { parseM3U8, selectAudioRendition, sortVariantsByBandwidth } from './src/m3u8-parser';
+import type {
+  M3U8Map,
+  M3U8Media,
+  M3U8Playlist,
+  M3U8Segment,
+  M3U8Variant,
+} from './src/m3u8-parser';
 import { downloadInitSegmentToFile, downloadSegmentToFile } from './src/downloader';
-import { abortActiveMerge, mergeToMp4 } from './src/merger';
+import { abortActiveMerge, mergeToMp4, muxToMp4 } from './src/merger';
 import type { HlsContainer } from './src/segment-validation';
 import {
   DEFAULT_MAX_SEGMENTS,
@@ -20,17 +26,19 @@ import {
   cleanupResumeState,
   initializeResumeState,
   loadResumeState,
+  recordAudioInitSegment,
+  recordAudioSegment,
   recordInitSegment,
   recordSegment,
   saveResumeMetadata,
 } from './src/resume';
-import type { ResumeState } from './src/resume';
+import type { ResumeMetadata, ResumeState, ResumeTrack } from './src/resume';
 import { redactUrl } from './src/url';
 import readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, lstat, realpath, rename, rm, stat, statfs, access } from 'node:fs/promises';
+import { mkdir, mkdtemp, lstat, realpath, rename, rm, stat, statfs, access } from 'node:fs/promises';
 import { constants, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -275,54 +283,84 @@ async function replaceSegmentFile(source: string, target: string): Promise<void>
   }
 }
 
-async function downloadSegments(
-  segments: M3U8Segment[],
-  playlistUrl: string,
-  tmpDir: string,
-  workDir: string,
-  resume: ResumeState,
-  network: NetworkClient,
-  keyCache: Map<string, Buffer>,
-  maxDownload: number,
-  maxSegmentSize: number,
-  container: HlsContainer,
-  map: M3U8Map | undefined,
-): Promise<{ segmentPaths: string[]; initPath?: string; totalBytes: number } | null> {
+interface DownloadBudget {
+  usedBytes: number;
+  maxBytes: number;
+  maxSegmentBytes: number;
+}
+
+interface DownloadTrackOptions {
+  kind: 'video' | 'audio';
+  segments: M3U8Segment[];
+  playlistUrl: string;
+  container: HlsContainer;
+  map: M3U8Map | undefined;
+  tmpDir: string;
+  workDir: string;
+  network: NetworkClient;
+  keyCache: Map<string, Buffer>;
+  metadata: ResumeMetadata;
+  completed: Set<number>;
+  initValid: boolean;
+  persist: boolean;
+  budget: DownloadBudget;
+}
+
+interface DownloadedTrack {
+  segmentPaths: string[];
+  initPath?: string;
+}
+
+function trackBytes(track: ResumeTrack): number {
+  const segments = Object.values(track.segments).reduce((sum, segment) => sum + segment.size, 0);
+  return segments + (track.initSegment?.size ?? 0);
+}
+
+async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedTrack | null> {
+  const {
+    kind,
+    segments,
+    playlistUrl,
+    container,
+    map,
+    tmpDir,
+    workDir,
+    network,
+    keyCache,
+    budget,
+  } = options;
+  const prefix = kind === 'audio' ? 'audio_' : '';
+  const kindLabel = kind === 'audio' ? 'audio ' : '';
+  const extension = container === 'fmp4' ? 'm4s' : 'ts';
+  const track = kind === 'audio' ? options.metadata.audio : options.metadata;
+  if (!track) {
+    throw new Error('Resume metadata has no audio track');
+  }
+
+  const trackWorkDir = join(workDir, kind);
+  await mkdir(trackWorkDir, { recursive: true });
+
+  let currentBytes = trackBytes(track);
   const segmentPaths: string[] = [];
   let initPath: string | undefined;
 
-  const initialSegmentBytes = Object.values(resume.metadata.segments).reduce(
-    (sum, segment) => sum + segment.size,
-    0,
-  );
-  const initialInitBytes = resume.metadata.initSegment?.size ?? 0;
-  let totalBytes = initialSegmentBytes + initialInitBytes;
-
-  if (maxDownload > 0 && totalBytes > maxDownload) {
-    throw new DownloadLimitError(
-      `Existing segments total ${formatBytes(totalBytes)}, above the ${formatBytes(maxDownload)} limit. Raise it with --max-download.`,
-    );
-  }
-
-  const extension = container === 'fmp4' ? 'm4s' : 'ts';
-
   if (map) {
-    const fileName = `init.${container === 'fmp4' ? 'mp4' : 'ts'}`;
+    const fileName = `${prefix}init.${container === 'fmp4' ? 'mp4' : 'ts'}`;
     initPath = join(tmpDir, fileName);
 
-    if (!resume.initValid || !resume.metadata.initSegment) {
-      if (maxDownload > 0 && totalBytes >= maxDownload) {
+    if (!options.initValid || !track.initSegment) {
+      if (budget.maxBytes > 0 && budget.usedBytes >= budget.maxBytes) {
         throw new DownloadLimitError(
-          `Download limit reached (${formatBytes(maxDownload)}). Resume later with: --resume ${tmpDir} --max-download ${formatBytes(maxDownload * 2)}`,
+          `Download limit reached (${formatBytes(budget.maxBytes)}). Resume later with: --resume ${tmpDir} --max-download ${formatBytes(budget.maxBytes * 2)}`,
         );
       }
 
-      const remainingLimit = maxDownload > 0 ? maxDownload - totalBytes : Infinity;
-      const maxBytes = Math.min(maxSegmentSize, remainingLimit);
+      const remaining = budget.maxBytes > 0 ? budget.maxBytes - budget.usedBytes : Infinity;
+      const maxBytes = Math.min(budget.maxSegmentBytes, remaining);
 
-      console.log('Downloading initialization segment...');
+      console.log(`Downloading ${kindLabel}initialization segment...`);
       try {
-        const partialPath = join(workDir, `${fileName}.part`);
+        const partialPath = join(trackWorkDir, `${fileName}.part`);
         const result = await downloadInitSegmentToFile(map, playlistUrl, partialPath, {
           network,
           keyCache,
@@ -332,14 +370,19 @@ async function downloadSegments(
 
         await replaceSegmentFile(partialPath, initPath);
 
-        if (resume.persist) {
-          recordInitSegment(resume.metadata, fileName, result.size, result.sha256);
-          await saveResumeMetadata(tmpDir, resume.metadata, workDir);
+        if (options.persist) {
+          if (kind === 'audio') {
+            recordAudioInitSegment(options.metadata, fileName, result.size, result.sha256);
+          } else {
+            recordInitSegment(options.metadata, fileName, result.size, result.sha256);
+          }
+          await saveResumeMetadata(tmpDir, options.metadata, trackWorkDir);
         }
 
-        totalBytes += result.size;
+        currentBytes += result.size;
+        budget.usedBytes += result.size;
       } catch (error) {
-        console.error('\nFailed to download the initialization segment.');
+        console.error(`\nFailed to download the ${kindLabel}initialization segment.`);
         console.error(errorMessage(error));
         console.log(`Resume later with: --resume ${tmpDir}`);
         process.exitCode = 1;
@@ -350,38 +393,46 @@ async function downloadSegments(
 
   const progress = new DownloadProgress(
     segments.length,
-    totalBytes,
-    resume.completed.size,
+    currentBytes,
+    options.completed.size,
     Boolean(stdin.isTTY),
+    kind === 'audio' ? 'Audio ' : '',
   );
 
-  console.log(`Downloading ${segments.length} segments...`);
+  console.log(
+    kind === 'audio'
+      ? `Downloading audio: ${segments.length} segments...`
+      : `Downloading ${segments.length} segments...`,
+  );
 
   try {
-    for (let i = 0; i < segments.length; i++) {
-      const segment = segments[i]!;
-      const fileName = `segment_${String(i).padStart(String(segments.length).length, '0')}.${extension}`;
+    for (let index = 0; index < segments.length; index++) {
+      const segment = segments[index]!;
+      const fileName = `${prefix}segment_${String(index).padStart(String(segments.length).length, '0')}.${extension}`;
       const segmentPath = join(tmpDir, fileName);
 
-      if (resume.completed.has(i)) {
+      if (options.completed.has(index)) {
         segmentPaths.push(segmentPath);
         continue;
       }
 
-      if (maxDownload > 0 && totalBytes >= maxDownload) {
+      if (budget.maxBytes > 0 && budget.usedBytes >= budget.maxBytes) {
         throw new DownloadLimitError(
-          `Download limit reached (${formatBytes(maxDownload)}). Resume later with: --resume ${tmpDir} --max-download ${formatBytes(maxDownload * 2)}`,
+          `Download limit reached (${formatBytes(budget.maxBytes)}). Resume later with: --resume ${tmpDir} --max-download ${formatBytes(budget.maxBytes * 2)}`,
         );
       }
 
-      const remainingLimit = maxDownload > 0 ? maxDownload - totalBytes : Infinity;
-      const maxBytes = Math.min(maxSegmentSize, remainingLimit);
+      const remaining = budget.maxBytes > 0 ? budget.maxBytes - budget.usedBytes : Infinity;
+      const maxBytes = Math.min(budget.maxSegmentBytes, remaining);
 
       try {
-        if (i === 0 || i % 10 === 0) {
+        if (index === 0 || index % 10 === 0) {
           await ensureFreeSpace(
             tmpDir,
-            Math.min(maxSegmentSize, Number.isFinite(maxBytes) ? maxBytes : maxSegmentSize) + FREE_SPACE_MARGIN,
+            Math.min(
+              budget.maxSegmentBytes,
+              Number.isFinite(maxBytes) ? maxBytes : budget.maxSegmentBytes,
+            ) + FREE_SPACE_MARGIN,
             'download',
           );
         }
@@ -392,13 +443,13 @@ async function downloadSegments(
         return null;
       }
 
-      progress.startSegment(i, segment.byterange?.length);
+      progress.startSegment(index, segment.byterange?.length);
       let attempts = 0;
       let downloaded = false;
 
       while (!downloaded) {
         try {
-          const partialPath = join(workDir, `${fileName}.part`);
+          const partialPath = join(trackWorkDir, `${fileName}.part`);
           const result = await downloadSegmentToFile(segment, playlistUrl, partialPath, {
             network,
             keyCache,
@@ -409,13 +460,18 @@ async function downloadSegments(
 
           await replaceSegmentFile(partialPath, segmentPath);
 
-          if (resume.persist) {
-            recordSegment(resume.metadata, i, fileName, result.size, result.sha256);
-            await saveResumeMetadata(tmpDir, resume.metadata, workDir);
+          if (options.persist) {
+            if (kind === 'audio') {
+              recordAudioSegment(options.metadata, index, fileName, result.size, result.sha256);
+            } else {
+              recordSegment(options.metadata, index, fileName, result.size, result.sha256);
+            }
+            await saveResumeMetadata(tmpDir, options.metadata, trackWorkDir);
           }
 
           segmentPaths.push(segmentPath);
-          totalBytes += result.size;
+          currentBytes += result.size;
+          budget.usedBytes += result.size;
           progress.completeSegment(result.size);
           downloaded = true;
         } catch (error) {
@@ -432,11 +488,11 @@ async function downloadSegments(
           }
 
           attempts++;
-          console.error(`\nFailed to download segment ${i + 1}`);
+          console.error(`\nFailed to download ${kindLabel}segment ${index + 1}`);
           console.error(errorMessage(error));
 
           if (attempts >= MAX_ATTEMPTS) {
-            console.error(`Max retries reached for segment ${i + 1}.`);
+            console.error(`Max retries reached for ${kindLabel}segment ${index + 1}.`);
             console.log(`Resume later with: --resume ${tmpDir}`);
             process.exitCode = 1;
             return null;
@@ -458,13 +514,12 @@ async function downloadSegments(
       }
     }
 
-    return { segmentPaths, initPath, totalBytes };
+    return { segmentPaths, ...(initPath ? { initPath } : {}) };
   } finally {
     progress.finish();
-    await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    await rm(trackWorkDir, { recursive: true, force: true }).catch(() => {});
   }
 }
-
 async function replaceFile(source: string, target: string): Promise<void> {
   try {
     await rename(source, target);
@@ -539,6 +594,12 @@ function estimateBytes(bandwidth: number, duration: number): number | undefined 
   return Number.isFinite(estimate) ? estimate : undefined;
 }
 
+function formatAudioRendition(rendition: M3U8Media): string {
+  const name = rendition.name || rendition.language || 'unnamed';
+  const language = rendition.language ? ` (${sanitizeForDisplay(rendition.language, 40)})` : '';
+  return `${sanitizeForDisplay(name, 80)}${language}`;
+}
+
 /**
  * Merge a saved working directory without contacting the playlist endpoint.
  * Used when the download finished but the merge failed, or when the endpoint
@@ -561,28 +622,41 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
   }
 
   console.log(`Validating segments in: ${dir}`);
-  const { metadata, completed, initValid } = await loadResumeState(dir);
+  const state = await loadResumeState(dir);
+  const { metadata } = state;
   const container: HlsContainer = metadata.container ?? 'mpegts';
-  if (metadata.segmentCount === 0) {
-    throw new Error(`No segments recorded in ${dir}`);
-  }
-  if (container === 'fmp4' && (!metadata.initSegment || !initValid)) {
-    throw new Error(
-      `Cannot merge ${dir}: the fMP4 initialization segment is missing or corrupt. Re-download with --resume ${dir} when the endpoint is available.`,
-    );
-  }
 
-  const missing: number[] = [];
-  for (let index = 0; index < metadata.segmentCount; index++) {
-    if (!completed.has(index)) {
-      missing.push(index);
+  const assertTrackComplete = (
+    track: ResumeTrack,
+    completed: Set<number>,
+    initValid: boolean,
+    label: string,
+  ): void => {
+    if (track.segmentCount === 0) {
+      throw new Error(`No ${label}segments recorded in ${dir}`);
     }
-  }
-  if (missing.length > 0) {
-    throw new Error(
-      `Cannot merge ${dir}: ${missing.length} of ${metadata.segmentCount} segments are missing or corrupt (first missing index: ${missing[0]}). Re-download with --resume ${dir} when the endpoint is available.`,
-    );
-  }
+
+    const trackContainer = track.container ?? 'mpegts';
+    if (trackContainer === 'fmp4' && (!track.initSegment || !initValid)) {
+      throw new Error(
+        `Cannot merge ${dir}: the fMP4 ${label}initialization segment is missing or corrupt. Re-download with --resume ${dir} when the endpoint is available.`,
+      );
+    }
+
+    const missing: number[] = [];
+    for (let index = 0; index < track.segmentCount; index++) {
+      if (!completed.has(index)) {
+        missing.push(index);
+      }
+    }
+    if (missing.length > 0) {
+      throw new Error(
+        `Cannot merge ${dir}: ${missing.length} of ${track.segmentCount} ${label}segments are missing or corrupt (first missing index: ${missing[0]}). Re-download with --resume ${dir} when the endpoint is available.`,
+      );
+    }
+  };
+
+  assertTrackComplete(metadata, state.completed, state.initValid, '');
 
   const segmentPaths: string[] = [];
   let totalBytes = metadata.initSegment?.size ?? 0;
@@ -591,12 +665,43 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
     segmentPaths.push(join(dir, segment.fileName));
     totalBytes += segment.size;
   }
-
   const initPath = metadata.initSegment ? join(dir, metadata.initSegment.fileName) : undefined;
+
+  let audioPaths: string[] | undefined;
+  let audioContainer: HlsContainer | undefined;
+  if (metadata.audio) {
+    if (!state.audio) {
+      throw new Error('Resume state is missing the audio track');
+    }
+
+    assertTrackComplete(metadata.audio, state.audio.completed, state.audio.initValid, 'audio ');
+
+    const audioTrack = metadata.audio;
+    const paths: string[] = [];
+    let audioBytes = audioTrack.initSegment?.size ?? 0;
+    for (let index = 0; index < audioTrack.segmentCount; index++) {
+      const segment = audioTrack.segments[String(index)]!;
+      paths.push(join(dir, segment.fileName));
+      audioBytes += segment.size;
+    }
+    if (audioTrack.initSegment) {
+      paths.unshift(join(dir, audioTrack.initSegment.fileName));
+    }
+
+    totalBytes += audioBytes;
+    audioPaths = paths;
+    audioContainer = audioTrack.container ?? 'mpegts';
+  }
 
   if (args.dryRun) {
     console.log(`Segments: ${metadata.segmentCount}`);
     console.log(`Container: ${container === 'fmp4' ? 'fMP4' : 'MPEG-TS'}`);
+    if (metadata.audio) {
+      console.log(`Audio segments: ${metadata.audio.segmentCount}`);
+      console.log(
+        `Audio container: ${(metadata.audio.container ?? 'mpegts') === 'fmp4' ? 'fMP4' : 'MPEG-TS'}`,
+      );
+    }
     if (metadata.durationSeconds !== undefined) {
       console.log(`Duration: ${formatDuration(metadata.durationSeconds)}`);
     }
@@ -606,9 +711,10 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
 
   await checkFfmpeg();
   const output = await resolveOutputPath(outputArg, args.force);
+  const mergeCopies = audioPaths ? 2 : 1;
   await ensureFreeSpace(
     dirname(output),
-    totalBytes + Math.max(FREE_SPACE_MARGIN, totalBytes * 0.05),
+    totalBytes * mergeCopies + Math.max(FREE_SPACE_MARGIN, totalBytes * 0.05),
     'merge',
   );
 
@@ -627,7 +733,17 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
   console.log(`Merging ${formatBytes(totalBytes)} from ${metadata.segmentCount} segments...`);
   const mergePaths = initPath ? [initPath, ...segmentPaths] : segmentPaths;
   try {
-    await mergeToMp4(mergePaths, partialOutput, { container });
+    if (audioPaths && audioContainer) {
+      const videoTemp = join(outputTempDir, 'video.mp4');
+      const audioTemp = join(outputTempDir, 'audio.mp4');
+
+      await mergeToMp4(mergePaths, videoTemp, { container });
+      await mergeToMp4(audioPaths, audioTemp, { container: audioContainer });
+      await muxToMp4(videoTemp, audioTemp, partialOutput);
+    } else {
+      await mergeToMp4(mergePaths, partialOutput, { container });
+    }
+
     console.log('Verifying output...');
     await validateMp4Output(partialOutput, metadata.durationSeconds);
     await assertOutputAvailable(output, args.force);
@@ -640,7 +756,6 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
     await rm(outputTempDir, { recursive: true, force: true }).catch(() => {});
     outputTempDir = undefined;
   }
-
   if (args.cleanup) {
     try {
       await cleanupResumeState(dir, metadata);
@@ -712,6 +827,8 @@ async function main(): Promise<void> {
   let playlistUrl = masterUrl;
   let selectedVariant: M3U8Variant | undefined;
 
+  let audioRendition: M3U8Media | undefined;
+
   if (playlist.isMaster) {
     if (!playlist.variants || playlist.variants.length === 0) {
       throw new Error('Master playlist contains no variants');
@@ -727,9 +844,13 @@ async function main(): Promise<void> {
       selectedVariant.audioGroup &&
       masterPlaylist.separateAudioGroups.includes(selectedVariant.audioGroup)
     ) {
-      throw new Error(
-        `The selected variant uses a separate audio rendition (${sanitizeForDisplay(selectedVariant.audioGroup, 80)}), which is not supported`,
-      );
+      audioRendition = selectAudioRendition(masterPlaylist.media, selectedVariant.audioGroup);
+      if (!audioRendition?.uri) {
+        throw new Error(
+          `The selected variant references audio group "${sanitizeForDisplay(selectedVariant.audioGroup, 80)}" without a separate rendition`,
+        );
+      }
+      console.log(`Audio rendition: ${formatAudioRendition(audioRendition)}`);
     }
 
     playlistUrl = resolveManifestUrl(selectedVariant.uri, masterUrl);
@@ -756,6 +877,45 @@ async function main(): Promise<void> {
   const segments = playlist.segments!;
   const container: HlsContainer = playlist.map ? 'fmp4' : 'mpegts';
   const map = playlist.map;
+
+  let audioPlaylistUrl = audioRendition?.uri
+    ? resolveManifestUrl(audioRendition.uri, masterUrl)
+    : undefined;
+  let audioSegments: M3U8Segment[] | undefined;
+  let audioContainer: HlsContainer | undefined;
+  let audioMap: M3U8Map | undefined;
+  let audioDuration: number | undefined;
+
+  if (audioPlaylistUrl) {
+    console.log(`Fetching audio playlist: ${redactUrl(audioPlaylistUrl)}`);
+    const audioResponse = await network.fetch(audioPlaylistUrl, {}, {
+      attempts: 3,
+      label: 'audio playlist',
+    });
+    if (!audioResponse.ok) {
+      throw new Error(`Failed to fetch audio playlist: ${audioResponse.status}`);
+    }
+
+    audioPlaylistUrl = audioResponse.url || audioPlaylistUrl;
+    const audioBody = await readResponseText(audioResponse, DEFAULT_PLAYLIST_MAX_BYTES);
+    assertPlaylistBody(audioBody);
+    const audioPlaylist = parseM3U8(audioBody);
+    if (audioPlaylist.isMaster) {
+      throw new Error('The audio rendition points to another master playlist');
+    }
+
+    audioDuration = validateMediaPlaylist(audioPlaylist);
+    audioSegments = audioPlaylist.segments!;
+    audioContainer = audioPlaylist.map ? 'fmp4' : 'mpegts';
+    audioMap = audioPlaylist.map;
+
+    if (Math.abs(audioDuration - expectedDuration) > Math.max(2, expectedDuration * 0.02)) {
+      console.warn(
+        `Warning: audio duration ${formatDuration(audioDuration)} differs from video duration ${formatDuration(expectedDuration)}`,
+      );
+    }
+  }
+
   const estimatedBytes = selectedVariant
     ? estimateBytes(selectedVariant.bandwidth, expectedDuration)
     : undefined;
@@ -764,6 +924,13 @@ async function main(): Promise<void> {
     console.log(`Segments: ${segments.length}`);
     console.log(`Container: ${container === 'fmp4' ? 'fMP4' : 'MPEG-TS'}`);
     console.log(`Duration: ${formatDuration(expectedDuration)}`);
+    if (audioSegments && audioContainer) {
+      console.log(`Audio segments: ${audioSegments.length}`);
+      console.log(`Audio container: ${audioContainer === 'fmp4' ? 'fMP4' : 'MPEG-TS'}`);
+      if (audioDuration !== undefined) {
+        console.log(`Audio duration: ${formatDuration(audioDuration)}`);
+      }
+    }
     if (estimatedBytes !== undefined) {
       console.log(`Estimated size: ~${formatBytes(estimatedBytes)} (bandwidth-based)`);
     }
@@ -801,17 +968,29 @@ async function main(): Promise<void> {
   const resume = await initializeResumeState({
     dir: tmpDir,
     sourceUrl: url,
-    mediaPlaylistUrl: playlistUrl,
-    segments,
     persist: true,
     tempDir: workDir,
-    container,
-    map,
+    video: { mediaPlaylistUrl: playlistUrl, segments, container, map },
+    ...(audioSegments && audioContainer && audioPlaylistUrl
+      ? {
+          audio: {
+            mediaPlaylistUrl: audioPlaylistUrl,
+            segments: audioSegments,
+            container: audioContainer,
+            map: audioMap,
+          },
+        }
+      : {}),
   });
 
   console.log(`Working dir: ${tmpDir}`);
   if (resume.completed.size > 0) {
     console.log(`Resuming with ${resume.completed.size}/${segments.length} segments already downloaded`);
+  }
+  if (resume.audio && resume.audio.completed.size > 0 && audioSegments) {
+    console.log(
+      `Resuming with ${resume.audio.completed.size}/${audioSegments.length} audio segments already downloaded`,
+    );
   }
 
   let outputTempDir: string | undefined;
@@ -826,44 +1005,99 @@ async function main(): Promise<void> {
     process.exit(130);
   });
 
-  const result = await downloadSegments(
+  const keyCache = new Map<string, Buffer>();
+  const budget: DownloadBudget = {
+    usedBytes:
+      trackBytes(resume.metadata) +
+      (resume.metadata.audio ? trackBytes(resume.metadata.audio) : 0),
+    maxBytes: maxDownload,
+    maxSegmentBytes: args.maxSegmentSize,
+  };
+
+  const videoResult = await downloadTrack({
+    kind: 'video',
     segments,
     playlistUrl,
-    tmpDir,
-    workDir,
-    resume,
-    network,
-    new Map(),
-    maxDownload,
-    args.maxSegmentSize,
     container,
     map,
-  );
-  if (!result) {
+    tmpDir,
+    workDir,
+    network,
+    keyCache,
+    metadata: resume.metadata,
+    completed: resume.completed,
+    initValid: resume.initValid,
+    persist: true,
+    budget,
+  });
+  if (!videoResult) {
     return;
   }
 
+  let audioResult: DownloadedTrack | undefined;
+  if (audioSegments && audioContainer && audioPlaylistUrl) {
+    if (!resume.audio) {
+      throw new Error('Resume state is missing the audio track');
+    }
+
+    const result = await downloadTrack({
+      kind: 'audio',
+      segments: audioSegments,
+      playlistUrl: audioPlaylistUrl,
+      container: audioContainer,
+      map: audioMap,
+      tmpDir,
+      workDir,
+      network,
+      keyCache,
+      metadata: resume.metadata,
+      completed: resume.audio.completed,
+      initValid: resume.audio.initValid,
+      persist: true,
+      budget,
+    });
+    if (!result) {
+      return;
+    }
+    audioResult = result;
+  }
+
+  const totalBytes = budget.usedBytes;
   const finalOutput = pickAvailableOutputPath(output, args.force);
   if (finalOutput.renamed) {
     console.log(`Output appeared during the download; saving to: ${finalOutput.path}`);
   }
 
   await assertOutputAvailable(finalOutput.path, args.force);
+  const mergeCopies = audioResult ? 2 : 1;
   await ensureFreeSpace(
     dirname(finalOutput.path),
-    result.totalBytes + Math.max(FREE_SPACE_MARGIN, result.totalBytes * 0.05),
+    totalBytes * mergeCopies + Math.max(FREE_SPACE_MARGIN, totalBytes * 0.05),
     'merge',
   );
 
   outputTempDir = await mkdtemp(join(dirname(finalOutput.path), '.meow-loader-'));
   const partialOutput = join(outputTempDir, basename(finalOutput.path));
 
-  console.log(`\nMerging ${formatBytes(result.totalBytes)} into MP4...`);
-  const mergePaths = result.initPath
-    ? [result.initPath, ...result.segmentPaths]
-    : result.segmentPaths;
+  console.log(`\nMerging ${formatBytes(totalBytes)} into MP4...`);
+  const videoPaths = videoResult.initPath
+    ? [videoResult.initPath, ...videoResult.segmentPaths]
+    : videoResult.segmentPaths;
   try {
-    await mergeToMp4(mergePaths, partialOutput, { container });
+    if (audioResult && audioContainer) {
+      const audioPaths = audioResult.initPath
+        ? [audioResult.initPath, ...audioResult.segmentPaths]
+        : audioResult.segmentPaths;
+      const videoTemp = join(outputTempDir, 'video.mp4');
+      const audioTemp = join(outputTempDir, 'audio.mp4');
+
+      await mergeToMp4(videoPaths, videoTemp, { container });
+      await mergeToMp4(audioPaths, audioTemp, { container: audioContainer });
+      await muxToMp4(videoTemp, audioTemp, partialOutput);
+    } else {
+      await mergeToMp4(videoPaths, partialOutput, { container });
+    }
+
     console.log('Verifying output...');
     await validateMp4Output(partialOutput, expectedDuration);
     await assertOutputAvailable(finalOutput.path, args.force);
@@ -876,7 +1110,6 @@ async function main(): Promise<void> {
     await rm(outputTempDir, { recursive: true, force: true }).catch(() => {});
     outputTempDir = undefined;
   }
-
   try {
     await cleanupWorkingDirectory(tmpDir, ownsTempDir, args.cleanup, resume);
   } catch (error) {

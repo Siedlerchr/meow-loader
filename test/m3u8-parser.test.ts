@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseM3U8, sortVariantsByBandwidth } from '../src/m3u8-parser';
+import { parseM3U8, selectAudioRendition, sortVariantsByBandwidth } from '../src/m3u8-parser';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const fixturesDir = join(__dirname, 'fixtures');
@@ -378,6 +378,69 @@ segment.ts
 
       expect(playlist.segments).toHaveLength(0);
       expect(playlist.targetDuration).toBe(10);
+    });
+  });
+
+  describe('separate audio renditions', () => {
+    const master = `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="audio/en.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Spanish",LANGUAGE="es",DEFAULT=NO,AUTOSELECT=YES,URI="audio/es.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,AUDIO="aud"
+video/720p.m3u8
+`;
+
+    it('parses EXT-X-MEDIA renditions', () => {
+      const playlist = parseM3U8(master);
+
+      expect(playlist.media).toHaveLength(2);
+      expect(playlist.media![0]).toMatchObject({
+        type: 'AUDIO',
+        groupId: 'aud',
+        name: 'English',
+        language: 'en',
+        default: true,
+        autoselect: true,
+        channels: '2',
+        uri: 'audio/en.m3u8',
+      });
+      expect(playlist.variants![0]!.audioGroup).toBe('aud');
+      expect(playlist.separateAudioGroups).toEqual(['aud']);
+    });
+
+    it('prefers the DEFAULT rendition', () => {
+      const playlist = parseM3U8(master);
+      const rendition = selectAudioRendition(playlist.media, 'aud');
+
+      expect(rendition?.language).toBe('en');
+    });
+
+    it('falls back to AUTOSELECT, then the first rendition', () => {
+      const playlist = parseM3U8(`#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Commentary",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=NO,URI="audio/commentary.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Main",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=YES,URI="audio/main.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"
+video.m3u8
+`);
+
+      expect(selectAudioRendition(playlist.media, 'aud')?.name).toBe('Main');
+    });
+
+    it('returns undefined when the group has no URI-bearing renditions', () => {
+      const playlist = parseM3U8(`#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Muxed",DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"
+video.m3u8
+`);
+
+      expect(selectAudioRendition(playlist.media, 'aud')).toBeUndefined();
+      expect(playlist.separateAudioGroups).toEqual([]);
+    });
+
+    it('returns undefined for an unknown group', () => {
+      const playlist = parseM3U8(master);
+
+      expect(selectAudioRendition(playlist.media, 'other')).toBeUndefined();
+      expect(selectAudioRendition(playlist.media, undefined)).toBeUndefined();
     });
   });
 });

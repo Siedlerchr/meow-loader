@@ -29,6 +29,7 @@ export interface M3U8Map {
 export interface M3U8Playlist {
   isMaster: boolean;
   variants?: M3U8Variant[];
+  media?: M3U8Media[];
   segments?: M3U8Segment[];
   targetDuration?: number;
   mediaSequence: number;
@@ -37,6 +38,17 @@ export interface M3U8Playlist {
   map?: M3U8Map;
   hasByteRange: boolean;
   separateAudioGroups: string[];
+}
+
+export interface M3U8Media {
+  type: string;
+  groupId: string;
+  name?: string;
+  language?: string;
+  uri?: string;
+  default: boolean;
+  autoselect: boolean;
+  channels?: string;
 }
 
 export interface M3U8Variant {
@@ -91,8 +103,25 @@ export function parseM3U8(content: string): M3U8Playlist {
 
     if (line.startsWith('#EXT-X-MEDIA:')) {
       const attrs = parseAttributes(line.slice(line.indexOf(':') + 1));
+      const type = (attrs.TYPE || '').toUpperCase();
       const groupId = attrs['GROUP-ID'];
-      if ((attrs.TYPE || '').toUpperCase() === 'AUDIO' && attrs.URI && groupId) {
+
+      if (groupId) {
+        const media: M3U8Media = {
+          type,
+          groupId,
+          name: attrs.NAME,
+          language: attrs.LANGUAGE,
+          uri: attrs.URI,
+          default: (attrs.DEFAULT || '').toUpperCase() === 'YES',
+          autoselect: (attrs.AUTOSELECT || '').toUpperCase() === 'YES',
+          channels: attrs.CHANNELS,
+        };
+        playlist.media ??= [];
+        playlist.media.push(media);
+      }
+
+      if (type === 'AUDIO' && attrs.URI && groupId) {
         if (!playlist.separateAudioGroups.includes(groupId)) {
           playlist.separateAudioGroups.push(groupId);
         }
@@ -279,6 +308,33 @@ export function parseM3U8(content: string): M3U8Playlist {
 /** Return variants ordered from highest to lowest bandwidth. */
 export function sortVariantsByBandwidth(variants: M3U8Variant[]): M3U8Variant[] {
   return [...variants].sort((a, b) => b.bandwidth - a.bandwidth);
+}
+
+/**
+ * Pick the audio rendition referenced by a variant's AUDIO group. Prefers the
+ * DEFAULT rendition, then AUTOSELECT, then the first entry that has a URI.
+ * Returns undefined when the audio is muxed into the variant.
+ */
+export function selectAudioRendition(
+  media: M3U8Media[] | undefined,
+  groupId: string | undefined,
+): M3U8Media | undefined {
+  if (!groupId || !media) {
+    return undefined;
+  }
+
+  const candidates = media.filter(
+    entry => entry.type === 'AUDIO' && entry.groupId === groupId && entry.uri,
+  );
+  if (candidates.length === 0) {
+    return undefined;
+  }
+
+  return (
+    candidates.find(entry => entry.default) ??
+    candidates.find(entry => entry.autoselect) ??
+    candidates[0]
+  );
 }
 
 function isSupportedKeyUri(uri: string): boolean {

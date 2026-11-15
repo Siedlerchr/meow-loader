@@ -22,76 +22,118 @@ export interface ResumeInitSegment {
   sha256: string;
 }
 
-export interface ResumeMetadata {
-  version: typeof RESUME_VERSION;
-  sourceUrlHash: string;
+export interface ResumeTrack {
   mediaPlaylistUrlHash: string;
-  sourceDisplay: string;
   mediaPlaylistUrlDisplay: string;
   segmentCount: number;
   segmentFingerprint: string;
   segments: Record<string, ResumeSegment>;
-  /** Optional for directories created before fMP4 support. */
   container?: HlsContainer;
-  /** Present for fMP4 playlists that declare #EXT-X-MAP. */
   initSegment?: ResumeInitSegment;
-  /** Optional for directories created before this field existed. */
   durationSeconds?: number;
 }
 
-export interface ResumeState {
-  metadata: ResumeMetadata;
+export interface ResumeMetadata extends ResumeTrack {
+  version: typeof RESUME_VERSION;
+  sourceUrlHash: string;
+  sourceDisplay: string;
+  /** Present when the stream uses a separate audio rendition. */
+  audio?: ResumeTrack;
+}
+
+export interface ResumeTrackState {
   completed: Set<number>;
   initValid: boolean;
+}
+
+export interface ResumeState extends ResumeTrackState {
+  metadata: ResumeMetadata;
+  audio?: ResumeTrackState;
   persist: boolean;
+}
+
+export interface ResumeTrackInput {
+  mediaPlaylistUrl: string;
+  segments: M3U8Segment[];
+  container: HlsContainer;
+  map?: M3U8Map;
 }
 
 export async function initializeResumeState(options: {
   dir: string;
   sourceUrl: string;
-  mediaPlaylistUrl: string;
-  segments: M3U8Segment[];
   persist: boolean;
   tempDir?: string;
-  container: HlsContainer;
-  map?: M3U8Map;
+  video: ResumeTrackInput;
+  audio?: ResumeTrackInput;
 }): Promise<ResumeState> {
-  const expected = createMetadata(
-    options.sourceUrl,
-    options.mediaPlaylistUrl,
-    options.segments,
-    options.container,
-    options.map,
-  );
+  const expected: ResumeMetadata = {
+    version: RESUME_VERSION,
+    sourceUrlHash: hashUrlIdentity(options.sourceUrl),
+    sourceDisplay: redactUrl(options.sourceUrl),
+    ...createTrack(options.video),
+  };
+  const expectedAudio = options.audio ? createTrack(options.audio) : undefined;
 
   if (!options.persist) {
-    return { metadata: expected, completed: new Set(), initValid: false, persist: false };
+    return {
+      metadata: expected,
+      completed: new Set(),
+      initValid: false,
+      ...(expectedAudio ? { audio: { completed: new Set(), initValid: false } } : {}),
+      persist: false,
+    };
+  }
+
+  if (expectedAudio) {
+    expected.audio = expectedAudio;
   }
 
   const metadataPath = join(options.dir, RESUME_METADATA_FILENAME);
   if (existsSync(metadataPath)) {
     const existing = parseMetadata(await readFile(metadataPath, 'utf8'), metadataPath);
-    assertSamePlaylist(existing, expected);
-    if (existing.container && existing.container !== expected.container) {
+
+    if (existing.sourceUrlHash !== expected.sourceUrlHash) {
       throw new Error(
-        `Resume directory holds ${existing.container} segments, but this playlist is ${expected.container}`,
+        `Resume directory belongs to a different playlist: expected ${existing.sourceDisplay}, received ${expected.sourceDisplay}`,
       );
     }
+
+    assertSameTrack(existing, expected, 'video');
     expected.segments = existing.segments;
     expected.initSegment = existing.initSegment;
+
+    if (expectedAudio) {
+      if (existing.audio) {
+        assertSameTrack(existing.audio, expectedAudio, 'audio');
+        expectedAudio.segments = existing.audio.segments;
+        expectedAudio.initSegment = existing.audio.initSegment;
+      }
+      expected.audio = expectedAudio;
+    } else if (existing.audio) {
+      throw new Error(
+        'Resume directory contains a separate audio track, but this playlist does not',
+      );
+    }
   }
 
   await saveResumeMetadata(options.dir, expected, options.tempDir);
-  const { completed, initValid } = await validateCompletedSegments(options.dir, expected);
+  const video = await validateTrack(options.dir, expected);
+  const audio = expected.audio ? await validateTrack(options.dir, expected.audio) : undefined;
   await saveResumeMetadata(options.dir, expected, options.tempDir);
 
-  return { metadata: expected, completed, initValid, persist: true };
+  return {
+    metadata: expected,
+    completed: video.completed,
+    initValid: video.initValid,
+    ...(audio ? { audio } : {}),
+    persist: true,
+  };
 }
 
-export interface LoadedResumeState {
+export interface LoadedResumeState extends ResumeTrackState {
   metadata: ResumeMetadata;
-  completed: Set<number>;
-  initValid: boolean;
+  audio?: ResumeTrackState;
 }
 
 /**
@@ -114,8 +156,15 @@ export async function loadResumeState(dir: string): Promise<LoadedResumeState> {
   }
 
   const metadata = parseMetadata(raw, metadataPath);
-  const { completed, initValid } = await validateCompletedSegments(dir, metadata);
-  return { metadata, completed, initValid };
+  const video = await validateTrack(dir, metadata);
+  const audio = metadata.audio ? await validateTrack(dir, metadata.audio) : undefined;
+
+  return {
+    metadata,
+    completed: video.completed,
+    initValid: video.initValid,
+    ...(audio ? { audio } : {}),
+  };
 }
 
 export function recordSegment(
@@ -137,6 +186,31 @@ export function recordInitSegment(
   metadata.initSegment = { fileName, size, sha256 };
 }
 
+export function recordAudioSegment(
+  metadata: ResumeMetadata,
+  index: number,
+  fileName: string,
+  size: number,
+  sha256: string,
+): void {
+  if (!metadata.audio) {
+    throw new Error('Resume metadata has no audio track');
+  }
+  metadata.audio.segments[String(index)] = { fileName, size, sha256 };
+}
+
+export function recordAudioInitSegment(
+  metadata: ResumeMetadata,
+  fileName: string,
+  size: number,
+  sha256: string,
+): void {
+  if (!metadata.audio) {
+    throw new Error('Resume metadata has no audio track');
+  }
+  metadata.audio.initSegment = { fileName, size, sha256 };
+}
+
 export async function saveResumeMetadata(
   dir: string,
   metadata: ResumeMetadata,
@@ -150,37 +224,35 @@ export async function saveResumeMetadata(
 }
 
 export async function cleanupResumeState(dir: string, metadata: ResumeMetadata): Promise<void> {
-  for (const segment of Object.values(metadata.segments)) {
-    await rm(join(dir, segment.fileName), { force: true });
-    await rm(join(dir, `${segment.fileName}.part`), { force: true });
-  }
-
-  if (metadata.initSegment) {
-    await rm(join(dir, metadata.initSegment.fileName), { force: true });
-    await rm(join(dir, `${metadata.initSegment.fileName}.part`), { force: true });
+  await cleanupTrack(dir, metadata);
+  if (metadata.audio) {
+    await cleanupTrack(dir, metadata.audio);
   }
 
   await rm(join(dir, RESUME_METADATA_FILENAME), { force: true });
 }
 
-function createMetadata(
-  sourceUrl: string,
-  mediaPlaylistUrl: string,
-  segments: M3U8Segment[],
-  container: HlsContainer,
-  map: M3U8Map | undefined,
-): ResumeMetadata {
+async function cleanupTrack(dir: string, track: ResumeTrack): Promise<void> {
+  for (const segment of Object.values(track.segments)) {
+    await rm(join(dir, segment.fileName), { force: true });
+    await rm(join(dir, `${segment.fileName}.part`), { force: true });
+  }
+
+  if (track.initSegment) {
+    await rm(join(dir, track.initSegment.fileName), { force: true });
+    await rm(join(dir, `${track.initSegment.fileName}.part`), { force: true });
+  }
+}
+
+function createTrack(input: ResumeTrackInput): ResumeTrack {
   return {
-    version: RESUME_VERSION,
-    sourceUrlHash: hashUrlIdentity(sourceUrl),
-    mediaPlaylistUrlHash: hashUrl(mediaPlaylistUrl),
-    sourceDisplay: redactUrl(sourceUrl),
-    mediaPlaylistUrlDisplay: redactUrl(mediaPlaylistUrl),
-    segmentCount: segments.length,
-    segmentFingerprint: fingerprintSegments(segments, map),
+    mediaPlaylistUrlHash: hashUrl(input.mediaPlaylistUrl),
+    mediaPlaylistUrlDisplay: redactUrl(input.mediaPlaylistUrl),
+    segmentCount: input.segments.length,
+    segmentFingerprint: fingerprintSegments(input.segments, input.map),
     segments: {},
-    container,
-    durationSeconds: segments.reduce((sum, segment) => sum + segment.duration, 0),
+    container: input.container,
+    durationSeconds: input.segments.reduce((sum, segment) => sum + segment.duration, 0),
   };
 }
 
@@ -198,72 +270,100 @@ function parseMetadata(raw: string, path: string): ResumeMetadata {
   }
 
   const candidate = parsed as Partial<ResumeMetadata>;
+  const audio = candidate.audio;
   if (
     candidate.version !== RESUME_VERSION ||
     typeof candidate.sourceUrlHash !== 'string' ||
-    typeof candidate.mediaPlaylistUrlHash !== 'string' ||
     typeof candidate.sourceDisplay !== 'string' ||
-    typeof candidate.mediaPlaylistUrlDisplay !== 'string' ||
-    !Number.isInteger(candidate.segmentCount) ||
-    (candidate.segmentCount ?? -1) < 0 ||
-    typeof candidate.segmentFingerprint !== 'string' ||
-    !candidate.segments ||
-    typeof candidate.segments !== 'object' ||
-    Array.isArray(candidate.segments)
+    !isTrack(candidate, '')
   ) {
     throw invalidMetadataError(path);
   }
 
-  if (
-    candidate.durationSeconds !== undefined &&
-    (typeof candidate.durationSeconds !== 'number' ||
-      !Number.isFinite(candidate.durationSeconds) ||
-      candidate.durationSeconds < 0)
-  ) {
+  if (audio !== undefined && !isTrack(audio, 'audio_')) {
     throw invalidMetadataError(path);
-  }
-
-  if (
-    candidate.container !== undefined &&
-    candidate.container !== 'mpegts' &&
-    candidate.container !== 'fmp4'
-  ) {
-    throw invalidMetadataError(path);
-  }
-
-  if (candidate.initSegment !== undefined) {
-    const init = candidate.initSegment;
-    if (
-      !init ||
-      typeof init !== 'object' ||
-      typeof init.fileName !== 'string' ||
-      !/^init\.(?:mp4|m4s)$/.test(init.fileName) ||
-      !Number.isInteger(init.size) ||
-      init.size < 0 ||
-      typeof init.sha256 !== 'string' ||
-      !/^[0-9a-f]{64}$/.test(init.sha256)
-    ) {
-      throw invalidMetadataError(path);
-    }
-  }
-
-  for (const [key, value] of Object.entries(candidate.segments)) {
-    if (
-      !/^\d+$/.test(key) ||
-      !value ||
-      typeof value !== 'object' ||
-      typeof value.fileName !== 'string' ||
-      !/^segment_\d+\.(?:ts|m4s)$/.test(value.fileName) ||
-      !Number.isInteger(value.size) ||
-      value.size < 0 ||
-      typeof value.sha256 !== 'string' ||
-      !/^[0-9a-f]{64}$/.test(value.sha256)
-    ) {
-      throw invalidMetadataError(path);
-    }
   }
 
   return candidate as ResumeMetadata;
+}
+
+function isTrack(value: unknown, prefix: '' | 'audio_'): value is ResumeTrack {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+
+  const track = value as Partial<ResumeTrack>;
+  if (
+    typeof track.mediaPlaylistUrlHash !== 'string' ||
+    typeof track.mediaPlaylistUrlDisplay !== 'string' ||
+    !Number.isInteger(track.segmentCount) ||
+    (track.segmentCount ?? -1) < 0 ||
+    typeof track.segmentFingerprint !== 'string' ||
+    !track.segments ||
+    typeof track.segments !== 'object' ||
+    Array.isArray(track.segments)
+  ) {
+    return false;
+  }
+
+  if (
+    track.container !== undefined &&
+    track.container !== 'mpegts' &&
+    track.container !== 'fmp4'
+  ) {
+    return false;
+  }
+
+  if (
+    track.durationSeconds !== undefined &&
+    (typeof track.durationSeconds !== 'number' ||
+      !Number.isFinite(track.durationSeconds) ||
+      track.durationSeconds < 0)
+  ) {
+    return false;
+  }
+
+  if (track.initSegment !== undefined && !isInitSegment(track.initSegment, prefix)) {
+    return false;
+  }
+
+  const segmentPattern =
+    prefix === 'audio_' ? /^audio_segment_\d+\.(?:ts|m4s)$/ : /^segment_\d+\.(?:ts|m4s)$/;
+  for (const [key, segment] of Object.entries(track.segments)) {
+    if (
+      !/^\d+$/.test(key) ||
+      !segment ||
+      typeof segment !== 'object' ||
+      typeof segment.fileName !== 'string' ||
+      !segmentPattern.test(segment.fileName) ||
+      !Number.isInteger(segment.size) ||
+      segment.size < 0 ||
+      typeof segment.sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(segment.sha256)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function isInitSegment(value: unknown, prefix: '' | 'audio_'): value is ResumeInitSegment {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const init = value as Partial<ResumeInitSegment>;
+  const pattern = prefix === 'audio_' ? /^audio_init\.(?:mp4|m4s)$/ : /^init\.(?:mp4|m4s)$/;
+
+  return (
+    typeof init.fileName === 'string' &&
+    pattern.test(init.fileName) &&
+    Number.isInteger(init.size) &&
+    (init.size ?? -1) >= 0 &&
+    typeof init.sha256 === 'string' &&
+    /^[0-9a-f]{64}$/.test(init.sha256)
+  );
 }
 
 function invalidMetadataError(path: string): Error {
@@ -272,79 +372,88 @@ function invalidMetadataError(path: string): Error {
   );
 }
 
-function assertSamePlaylist(actual: ResumeMetadata, expected: ResumeMetadata): void {
-  if (actual.sourceUrlHash !== expected.sourceUrlHash) {
-    throw new Error(
-      `Resume directory belongs to a different playlist: expected ${actual.sourceDisplay}, received ${expected.sourceDisplay}`,
-    );
-  }
+function assertSameTrack(
+  actual: ResumeTrack,
+  expected: ResumeTrack,
+  kind: 'video' | 'audio',
+): void {
+  const playlistLabel = kind === 'audio' ? 'audio playlist' : 'media playlist';
 
   if (actual.mediaPlaylistUrlHash !== expected.mediaPlaylistUrlHash) {
     throw new Error(
-      `Resume directory belongs to a different media playlist or variant: expected ${actual.mediaPlaylistUrlDisplay}, received ${expected.mediaPlaylistUrlDisplay}`,
+      `Resume directory belongs to a different ${playlistLabel} or variant: expected ${actual.mediaPlaylistUrlDisplay}, received ${expected.mediaPlaylistUrlDisplay}`,
     );
   }
 
   if (actual.segmentCount !== expected.segmentCount) {
     throw new Error(
-      `Resume directory has ${actual.segmentCount} segments, but this playlist has ${expected.segmentCount}`,
+      kind === 'audio'
+        ? `Resume directory audio playlist has ${actual.segmentCount} segments, but this playlist has ${expected.segmentCount}`
+        : `Resume directory has ${actual.segmentCount} segments, but this playlist has ${expected.segmentCount}`,
     );
   }
 
   if (actual.segmentFingerprint !== expected.segmentFingerprint) {
-    throw new Error('Resume directory belongs to a different version of this playlist');
+    throw new Error(
+      kind === 'audio'
+        ? 'Resume directory belongs to a different version of this audio playlist'
+        : 'Resume directory belongs to a different version of this playlist',
+    );
+  }
+
+  if (actual.container && expected.container && actual.container !== expected.container) {
+    throw new Error(
+      `Resume directory holds ${actual.container} ${kind === 'audio' ? 'audio ' : ''}segments, but this playlist is ${expected.container}`,
+    );
   }
 }
 
-async function validateCompletedSegments(
-  dir: string,
-  metadata: ResumeMetadata,
-): Promise<{ completed: Set<number>; initValid: boolean }> {
+async function validateTrack(dir: string, track: ResumeTrack): Promise<ResumeTrackState> {
   const completed = new Set<number>();
-  const container = metadata.container ?? 'mpegts';
+  const container = track.container ?? 'mpegts';
 
   let initValid = false;
-  const init = metadata.initSegment;
+  const init = track.initSegment;
   if (init) {
     const initPath = join(dir, init.fileName);
     const info = await lstat(initPath).catch(() => undefined);
 
     if (!info?.isFile() || info.isSymbolicLink() || info.size !== init.size) {
       await rm(initPath, { force: true });
-      delete metadata.initSegment;
+      delete track.initSegment;
     } else {
       const scan = await scanSegmentFile(initPath, container, { requireFtyp: true }).catch(
         () => undefined,
       );
       if (!scan || !scan.valid || scan.size !== init.size || scan.sha256 !== init.sha256) {
         await rm(initPath, { force: true });
-        delete metadata.initSegment;
+        delete track.initSegment;
       } else {
         initValid = true;
       }
     }
   }
 
-  for (const [key, segment] of Object.entries(metadata.segments)) {
+  for (const [key, segment] of Object.entries(track.segments)) {
     const index = Number(key);
     const path = join(dir, segment.fileName);
 
-    if (!Number.isInteger(index) || index < 0 || index >= metadata.segmentCount) {
-      delete metadata.segments[key];
+    if (!Number.isInteger(index) || index < 0 || index >= track.segmentCount) {
+      delete track.segments[key];
       continue;
     }
 
     const info = await lstat(path).catch(() => undefined);
     if (!info?.isFile() || info.isSymbolicLink() || info.size !== segment.size) {
       await rm(path, { force: true });
-      delete metadata.segments[key];
+      delete track.segments[key];
       continue;
     }
 
     const scan = await scanSegmentFile(path, container).catch(() => undefined);
     if (!scan || !scan.valid || scan.size !== segment.size || scan.sha256 !== segment.sha256) {
       await rm(path, { force: true });
-      delete metadata.segments[key];
+      delete track.segments[key];
       continue;
     }
 

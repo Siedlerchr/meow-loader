@@ -153,25 +153,48 @@ async function mergeFmp4(segmentPaths: string[], outputPath: string): Promise<vo
   }
 }
 
+export async function muxToMp4(
+  videoPath: string,
+  audioPath: string,
+  outputPath: string,
+): Promise<void> {
+  await runFfmpegProcess([
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-i',
+    videoPath,
+    '-i',
+    audioPath,
+    '-map',
+    '0:v:0',
+    '-map',
+    '1:a:0',
+    '-c',
+    'copy',
+    outputPath,
+  ]);
+}
+
 function runFfmpeg(args: string[]): Promise<void> {
+  return runFfmpegProcess([
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-f',
+    'concat',
+    '-safe',
+    '1',
+    '-protocol_whitelist',
+    'file,pipe',
+    ...args,
+  ]);
+}
+
+function runFfmpegProcess(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     let stderr = '';
-    const proc = spawn(
-      'ffmpeg',
-      [
-        '-hide_banner',
-        '-nostdin',
-        '-y',
-        '-f',
-        'concat',
-        '-safe',
-        '1',
-        '-protocol_whitelist',
-        'file,pipe',
-        ...args,
-      ],
-      { stdio: ['ignore', 'ignore', 'pipe'] },
-    );
+    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
 
     activeFfmpeg = proc;
 

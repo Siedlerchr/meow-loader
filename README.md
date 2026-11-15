@@ -105,6 +105,16 @@ Headers remain scoped to the playlist origin, so a separate CDN host still needs
 
 Copied commands usually contain cookies and other credentials. They end up in shell history unless you prevent it, so treat them as secrets.
 
+### Separate audio tracks
+
+When a master playlist declares audio renditions (`#EXT-X-MEDIA:TYPE=AUDIO`),
+meow-loader downloads the rendition marked `DEFAULT=YES`, falling back to
+`AUTOSELECT=YES` and then the first entry with a URI, and muxes it into the
+output. The chosen rendition is printed before downloading. If the variant's
+audio is already muxed, no separate download happens.
+
+Manual language selection is not exposed yet.
+
 ### Private networks and HTTP
 
 Manifest URLs on loopback or private networks are blocked by default to reduce SSRF risk. For local testing or a LAN media server:
@@ -255,6 +265,7 @@ playlists require a server or CDN that honors `Range` requests.
 - AES-128 encrypted HLS support, including key rotation and default IVs
 - MPEG-TS and fMP4/CMAF segments, including a single `#EXT-X-MAP` init segment
 - Byte-range (`#EXT-X-BYTERANGE`) playlists, including single-file HLS
+- Separate audio renditions, selected by DEFAULT/AUTOSELECT and muxed into the output
 - Streamed segment downloads with incremental SHA-256 hashing
 - Segment container validation and ffprobe duration verification before replacing output
 - Resume interrupted downloads without treating partial files as complete
@@ -267,8 +278,8 @@ playlists require a server or CDN that honors `Range` requests.
 - `SAMPLE-AES` and `SAMPLE-AES-CTR` encryption are not supported.
 - Changing the `#EXT-X-MAP` initialization segment mid-playlist is not supported.
 - Live playlists (missing `#EXT-X-ENDLIST`) are not supported.
-- Variants that reference a separate audio rendition
-  (`#EXT-X-MEDIA:TYPE=AUDIO` with a URI) are not supported.
+- Audio renditions are selected automatically; there is no flag to choose a
+  different language yet.
 - The output is remuxed with `-c copy`; the codecs must be compatible with
   the MP4 container.
 - ffmpeg and ffprobe parse untrusted media. Keep them updated; use a sandbox or

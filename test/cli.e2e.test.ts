@@ -66,6 +66,29 @@ media/all-short.ts
 #EXT-X-ENDLIST
 `;
 
+const audioMasterPlaylist = `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="audio/playlist.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Spanish",LANGUAGE="es",DEFAULT=NO,AUTOSELECT=YES,URI="audio/playlist.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,AUDIO="aud"
+av-video.m3u8
+`;
+
+const audioMasterLowBandwidth = audioMasterPlaylist.replace('BANDWIDTH=2000000', 'BANDWIDTH=1000');
+
+async function ffprobeStreamTypes(filePath: string): Promise<string[]> {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v',
+    'error',
+    '-show_entries',
+    'stream=codec_type',
+    '-of',
+    'json',
+    filePath,
+  ]);
+  const parsed = JSON.parse(stdout) as { streams?: Array<{ codec_type?: string }> };
+  return (parsed.streams ?? []).map(stream => stream.codec_type ?? '');
+}
+
 const mediaPlaylist = `#EXTM3U
 #EXT-X-TARGETDURATION:10
 #EXT-X-MEDIA-SEQUENCE:0
@@ -252,6 +275,41 @@ media/all.mp4
       if (pathname === '/fmp4-bad/init.mp4') {
         response.writeHead(200, { 'content-type': 'video/mp4' });
         response.end('<html><body>not an initialization segment</body></html>');
+        return;
+      }
+
+      if (pathname === '/av-master.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(audioMasterPlaylist);
+        return;
+      }
+
+      if (pathname === '/av-master-lowband.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(audioMasterLowBandwidth);
+        return;
+      }
+
+      if (pathname === '/av-video.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(mediaPlaylist);
+        return;
+      }
+
+      if (pathname.startsWith('/audio/')) {
+        const fileName = pathname.split('/').pop()!;
+        try {
+          const content = await readFile(join(fixtures, 'audio', fileName));
+          response.writeHead(200, {
+            'content-type': fileName.endsWith('.m3u8')
+              ? 'application/vnd.apple.mpegurl'
+              : 'video/mp2t',
+          });
+          response.end(content);
+        } catch {
+          response.writeHead(404);
+          response.end('not found');
+        }
         return;
       }
 
@@ -904,6 +962,84 @@ media/all.mp4
     expect(stdout).toContain('Resuming with 2/3 segments already downloaded');
     expect(stdout).not.toContain('Downloading initialization segment');
     expect(stdout).toContain('Done! Saved to');
+  });
+
+  it('downloads a separate audio rendition and muxes it', async () => {
+    const info = await command([`${baseUrl}/av-master.m3u8`, '--dry-run']);
+    expect(info.stdout).toContain('Audio segments: 3');
+    expect(info.stdout).toContain('Audio container: MPEG-TS');
+
+    const output = join(tempRoot, 'av.mp4');
+    const { stdout } = await command([`${baseUrl}/av-master.m3u8`, output]);
+
+    expect(stdout).toContain('Audio rendition: English (en)');
+    expect(stdout).toContain('Fetching audio playlist');
+    expect(stdout).toContain('Downloading audio: 3 segments');
+    expect(stdout).toContain('Done! Saved to');
+
+    const streams = await ffprobeStreamTypes(output);
+    expect(streams).toContain('video');
+    expect(streams).toContain('audio');
+  });
+
+  it('applies --max-download across video and audio', async () => {
+    const error = await command([
+      `${baseUrl}/av-master-lowband.m3u8`,
+      join(tempRoot, 'av-limit.mp4'),
+      '--max-download',
+      '400KB',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toMatch(/limit/i);
+  });
+
+  it('resumes separate audio segments', async () => {
+    const resumeDir = join(tempRoot, 'av-resume');
+    await mkdir(resumeDir, { recursive: true });
+    await command([
+      `${baseUrl}/av-master.m3u8`,
+      join(tempRoot, 'av-resume-first.mp4'),
+      '--resume',
+      resumeDir,
+    ]);
+
+    const files = await readdir(resumeDir);
+    const audioSegment = files.find(file => file.startsWith('audio_segment_'))!;
+    await rm(join(resumeDir, audioSegment));
+
+    const { stdout } = await command([
+      `${baseUrl}/av-master.m3u8`,
+      join(tempRoot, 'av-resume-second.mp4'),
+      '--resume',
+      resumeDir,
+    ]);
+
+    expect(stdout).toContain('Resuming with 2/3 audio segments already downloaded');
+    expect(stdout).toContain('Done! Saved to');
+  });
+
+  it('merges a saved directory with separate audio via --merge-only', async () => {
+    const resumeDir = join(tempRoot, 'av-offline');
+    await mkdir(resumeDir, { recursive: true });
+    await command([
+      `${baseUrl}/av-master.m3u8`,
+      join(tempRoot, 'av-offline-source.mp4'),
+      '--resume',
+      resumeDir,
+    ]);
+
+    const output = join(tempRoot, 'av-offline.mp4');
+    const { stdout } = await commandBare(['--merge-only', resumeDir, output, '--cleanup']);
+
+    expect(stdout).toContain('Done! Saved to');
+    const streams = await ffprobeStreamTypes(output);
+    expect(streams).toContain('video');
+    expect(streams).toContain('audio');
+
+    const files = await readdir(resumeDir);
+    expect(files.filter(file => /\.(ts|m4s)$/.test(file))).toHaveLength(0);
+    expect(files).not.toContain('meow-loader.resume.json');
   });
 
   it('rejects a non-fMP4 initialization segment', async () => {

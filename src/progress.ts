@@ -5,6 +5,7 @@ const LARGE_DOWNLOAD_WARNING_BYTES = 5 * 1024 ** 3;
 export class DownloadProgress {
   private readonly tty: boolean;
   private readonly totalSegments: number;
+  private readonly label: string;
   private completedSegments: number;
   private baseBytes: number;
   private segmentIndex = 0;
@@ -18,8 +19,15 @@ export class DownloadProgress {
   private warnedLarge = false;
   private hasRendered = false;
 
-  constructor(totalSegments: number, initialBytes: number, initialCompleted: number, tty: boolean) {
+  constructor(
+    totalSegments: number,
+    initialBytes: number,
+    initialCompleted: number,
+    tty: boolean,
+    label = '',
+  ) {
     this.totalSegments = totalSegments;
+    this.label = label;
     this.baseBytes = initialBytes;
     this.completedSegments = initialCompleted;
     this.lastSampleBytes = initialBytes;
@@ -67,7 +75,7 @@ export class DownloadProgress {
       );
     }
 
-    const parts = [`Segment ${this.segmentIndex + 1}/${this.totalSegments}`];
+    const parts = [`${this.label}Segment ${this.segmentIndex + 1}/${this.totalSegments}`];
 
     if (this.segmentExpected !== undefined) {
       parts.push(`${formatBytes(this.segmentBytes)} / ${formatBytes(this.segmentExpected)}`);
