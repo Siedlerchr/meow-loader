@@ -1,7 +1,9 @@
 import { copyFile, link, mkdir, writeFile, unlink, rm, mkdtemp } from 'node:fs/promises';
+import { createReadStream, rmSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { rmSync } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 import { dirname, join } from 'node:path';
+import type { HlsContainer } from './segment-validation';
 
 let activeFfmpeg: ChildProcess | undefined;
 let activeMergeTempDir: string | undefined;
@@ -16,9 +18,27 @@ export function abortActiveMerge(): void {
   }
 }
 
-export async function mergeToMp4(segmentPaths: string[], outputPath: string): Promise<void> {
+export interface MergeOptions {
+  /**
+   * MPEG-TS is joined with the ffmpeg concat demuxer and needs the
+   * aac_adtstoasc bitstream filter. fMP4 fragments are byte-concatenated
+   * through ffmpeg stdin instead.
+   */
+  container?: HlsContainer;
+}
+
+export async function mergeToMp4(
+  segmentPaths: string[],
+  outputPath: string,
+  options: MergeOptions = {},
+): Promise<void> {
   if (segmentPaths.length === 0) {
     throw new Error('No segments to merge');
+  }
+
+  if (options.container === 'fmp4') {
+    await mergeFmp4(segmentPaths, outputPath);
+    return;
   }
 
   const inputRoot = dirname(segmentPaths[0]!);
@@ -66,6 +86,70 @@ export async function mergeToMp4(segmentPaths: string[], outputPath: string): Pr
     if (activeMergeTempDir === tmpDir) {
       activeMergeTempDir = undefined;
     }
+  }
+}
+
+/**
+ * fMP4 fragments are not standalone inputs for the concat demuxer. Feed the
+ * initialization segment followed by the media fragments to ffmpeg over stdin
+ * and remux the concatenated stream into a regular MP4.
+ */
+async function mergeFmp4(segmentPaths: string[], outputPath: string): Promise<void> {
+  const proc = spawn(
+    'ffmpeg',
+    ['-hide_banner', '-nostdin', '-y', '-i', 'pipe:0', '-c', 'copy', outputPath],
+    { stdio: ['pipe', 'ignore', 'pipe'] },
+  );
+  activeFfmpeg = proc;
+
+  let stderr = '';
+  let spawnError: Error | undefined;
+  proc.stderr?.setEncoding('utf8');
+  proc.stderr?.on('data', (chunk: string) => {
+    stderr = (stderr + chunk).slice(-16_000);
+  });
+
+  const closed = new Promise<number | null>((resolve) => {
+    proc.on('close', (code) => {
+      if (activeFfmpeg === proc) {
+        activeFfmpeg = undefined;
+      }
+      resolve(code);
+    });
+    proc.on('error', (error) => {
+      if (activeFfmpeg === proc) {
+        activeFfmpeg = undefined;
+      }
+      spawnError = error;
+      resolve(null);
+    });
+  });
+
+  try {
+    for (const path of segmentPaths) {
+      await pipeline(createReadStream(path), proc.stdin!, { end: false });
+    }
+    proc.stdin!.end();
+  } catch (error) {
+    proc.kill('SIGTERM');
+    await closed;
+    const cause = spawnError ?? error;
+    if ((cause as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error('ffmpeg not found. Please install ffmpeg and ensure it is in your PATH.');
+    }
+    const detail = stderr.trim();
+    throw new Error(`${errorMessage(cause)}${detail ? `\n${detail}` : ''}`);
+  }
+
+  const code = await closed;
+  if (spawnError) {
+    if ((spawnError as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error('ffmpeg not found. Please install ffmpeg and ensure it is in your PATH.');
+    }
+    throw spawnError;
+  }
+  if (code !== 0) {
+    throw new Error(`ffmpeg exited with code ${code}${stderr.trim() ? `\n${stderr.trim()}` : ''}`);
   }
 }
 

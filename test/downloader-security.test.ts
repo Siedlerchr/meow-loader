@@ -56,7 +56,7 @@ describe('downloader security', () => {
         { uri: 'segment.ts', duration: 10, sequence: 0 },
         `${baseUrl}/playlist.m3u8`,
         destination,
-        { network: client(), keyCache: new Map(), maxBytes: 1024 * 1024 },
+        { network: client(), keyCache: new Map(), maxBytes: 1024 * 1024, container: 'mpegts' },
       ),
     ).rejects.toThrow();
 
@@ -71,7 +71,7 @@ describe('downloader security', () => {
         { uri: 'segment.ts', duration: 10, sequence: 0 },
         `${baseUrl}/playlist.m3u8`,
         destination,
-        { network: client(), keyCache: new Map(), maxBytes: 1000 },
+        { network: client(), keyCache: new Map(), maxBytes: 1000, container: 'mpegts' },
       ),
     ).rejects.toThrow('above the');
   });

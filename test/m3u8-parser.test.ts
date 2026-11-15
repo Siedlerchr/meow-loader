@@ -203,7 +203,7 @@ segment.ts
       expect(() => parseM3U8(content)).toThrow('AES-128 key is missing the URI attribute');
     });
 
-    it('should flag fragmented MP4 playlists', () => {
+    it('parses the initialization segment of fragmented MP4 playlists', () => {
       const content = `#EXTM3U
 #EXT-X-MAP:URI="init.mp4"
 #EXTINF:10,
@@ -213,6 +213,62 @@ segment.m4s
       const playlist = parseM3U8(content);
 
       expect(playlist.hasMap).toBe(true);
+      expect(playlist.map).toEqual({ uri: 'init.mp4' });
+    });
+
+    it('parses a byte-range initialization segment', () => {
+      const content = `#EXTM3U
+#EXT-X-MAP:URI="main.mp4",BYTERANGE="720@0"
+#EXTINF:10,
+segment.m4s
+#EXT-X-ENDLIST
+`;
+      const playlist = parseM3U8(content);
+
+      expect(playlist.map).toEqual({
+        uri: 'main.mp4',
+        byterange: { length: 720, offset: 0 },
+      });
+    });
+
+    it('rejects an initialization segment without a URI', () => {
+      const content = `#EXTM3U
+#EXT-X-MAP:BYTERANGE="720@0"
+#EXTINF:10,
+segment.m4s
+#EXT-X-ENDLIST
+`;
+
+      expect(() => parseM3U8(content)).toThrow('#EXT-X-MAP is missing the URI attribute');
+    });
+
+    it('rejects an initialization segment that changes mid-playlist', () => {
+      const content = `#EXTM3U
+#EXT-X-MAP:URI="init-1.mp4"
+#EXTINF:10,
+segment-1.m4s
+#EXT-X-MAP:URI="init-2.mp4"
+#EXTINF:10,
+segment-2.m4s
+#EXT-X-ENDLIST
+`;
+
+      expect(() => parseM3U8(content)).toThrow('Changing the initialization segment mid-playlist');
+    });
+
+    it('rejects an initialization segment after media segments', () => {
+      const content = `#EXTM3U
+#EXTINF:10,
+segment-1.m4s
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:10,
+segment-2.m4s
+#EXT-X-ENDLIST
+`;
+
+      expect(() => parseM3U8(content)).toThrow(
+        'Initialization segments after media segments are not supported',
+      );
     });
 
     it('should flag byte-range playlists', () => {

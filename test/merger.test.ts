@@ -7,6 +7,7 @@ import { escapeConcatPath, mergeToMp4 } from '../src/merger';
 
 const hasFfmpeg = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' }).status === 0;
 const fixtures = join(import.meta.dirname, 'fixtures', 'segments');
+const fmp4Fixtures = join(import.meta.dirname, 'fixtures', 'fmp4');
 
 describe('escapeConcatPath', () => {
   it('escapes apostrophes using ffmpeg concat syntax', () => {
@@ -56,6 +57,24 @@ describe.skipIf(!hasFfmpeg)('mergeToMp4 paths', () => {
 
     const output = join(tempRoot, 'backslash.mp4');
     await mergeToMp4([first, second], output);
+
+    expect((await stat(output)).size).toBeGreaterThan(0);
+  });
+
+  it('merges an fMP4 initialization segment and fragments', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'meow-loader-merge-'));
+    const output = join(tempRoot, 'fmp4.mp4');
+
+    await mergeToMp4(
+      [
+        join(fmp4Fixtures, 'init.mp4'),
+        join(fmp4Fixtures, 'segment_0.m4s'),
+        join(fmp4Fixtures, 'segment_1.m4s'),
+        join(fmp4Fixtures, 'segment_2.m4s'),
+      ],
+      output,
+      { container: 'fmp4' },
+    );
 
     expect((await stat(output)).size).toBeGreaterThan(0);
   });

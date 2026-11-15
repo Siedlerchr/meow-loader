@@ -111,4 +111,32 @@ describe('fixtures', () => {
       }
     });
   });
+
+  describe('fMP4 fixture files', () => {
+    const fmp4Dir = join(fixturesDir, 'fmp4');
+
+    it('should have an initialization segment starting with an ftyp box', () => {
+      const content = readFileSync(join(fmp4Dir, 'init.mp4'));
+
+      expect(content.subarray(4, 8).toString('latin1')).toBe('ftyp');
+    });
+
+    it('should have media segments starting with a styp or moof box', () => {
+      for (const name of ['segment_0.m4s', 'segment_1.m4s', 'segment_2.m4s']) {
+        const content = readFileSync(join(fmp4Dir, name));
+        const type = content.subarray(4, 8).toString('latin1');
+
+        expect(['styp', 'moof', 'sidx']).toContain(type);
+      }
+    });
+
+    it('should have a playlist referencing the initialization segment', () => {
+      const content = readFileSync(join(fmp4Dir, 'playlist.m3u8'), 'utf-8');
+
+      expect(content).toContain('#EXTM3U');
+      expect(content).toContain('#EXT-X-MAP:URI="init.mp4"');
+      expect(content).toContain('segment_0.m4s');
+      expect(content).toContain('#EXT-X-ENDLIST');
+    });
+  });
 });

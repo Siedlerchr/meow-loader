@@ -41,11 +41,25 @@ const livePlaylist = `#EXTM3U
 segments/segment_000_red.ts
 `;
 
-const mapPlaylist = `#EXTM3U
-#EXT-X-MAP:URI="init.mp4"
-#EXT-X-TARGETDURATION:10
-#EXTINF:10,
-segments/segment_000_red.ts
+const fmp4Playlist = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MAP:URI="fmp4/init.mp4"
+#EXTINF:2.000000,
+fmp4/segment_0.m4s
+#EXTINF:2.000000,
+fmp4/segment_1.m4s
+#EXTINF:2.000000,
+fmp4/segment_2.m4s
+#EXT-X-ENDLIST
+`;
+
+const badFmp4Playlist = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MAP:URI="fmp4-bad/init.mp4"
+#EXTINF:2.000000,
+fmp4/segment_0.m4s
 #EXT-X-ENDLIST
 `;
 
@@ -111,9 +125,36 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
         return;
       }
 
-      if (pathname === '/map.m3u8') {
+      if (pathname === '/fmp4.m3u8') {
         response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
-        response.end(mapPlaylist);
+        response.end(fmp4Playlist);
+        return;
+      }
+
+      if (pathname === '/fmp4-bad.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(badFmp4Playlist);
+        return;
+      }
+
+      if (pathname === '/fmp4-bad/init.mp4') {
+        response.writeHead(200, { 'content-type': 'video/mp4' });
+        response.end('<html><body>not an initialization segment</body></html>');
+        return;
+      }
+
+      if (pathname.startsWith('/fmp4/')) {
+        const fileName = pathname.split('/').pop()!;
+        try {
+          const content = await readFile(join(fixtures, 'fmp4', fileName));
+          response.writeHead(200, {
+            'content-type': fileName.endsWith('.m4s') ? 'video/iso.segment' : 'video/mp4',
+          });
+          response.end(content);
+        } catch {
+          response.writeHead(404);
+          response.end('not found');
+        }
         return;
       }
 
@@ -451,6 +492,7 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
     const metadataPath = join(resumeDir, 'meow-loader.resume.json');
     const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as Record<string, unknown>;
     delete metadata.durationSeconds;
+    delete metadata.container;
     await writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
 
     const output = join(tempRoot, 'offline-legacy.mp4');
@@ -636,11 +678,69 @@ describe.skipIf(!canRun)('CLI end-to-end', () => {
     expect(error.stderr).toContain('Live or incomplete playlists are not supported');
   });
 
-  it('fails clearly for fragmented MP4 playlists', async () => {
-    const error = await command([`${baseUrl}/map.m3u8`, join(tempRoot, 'map.mp4')]).catch(error => error);
+  it('downloads and merges fragmented MP4 playlists', async () => {
+    const info = await command([`${baseUrl}/fmp4.m3u8`, '--dry-run']);
+    expect(info.stdout).toContain('Container: fMP4');
+    expect(info.stdout).toContain('Segments: 3');
+
+    const output = join(tempRoot, 'fmp4.mp4');
+    const { stdout } = await command([`${baseUrl}/fmp4.m3u8`, output]);
+
+    expect(stdout).toContain('Downloading initialization segment');
+    expect(stdout).toContain('Done! Saved to');
+    expect((await readFile(output)).byteLength).toBeGreaterThan(0);
+  });
+
+  it('merges a saved fMP4 directory with --merge-only', async () => {
+    const resumeDir = join(tempRoot, 'fmp4-offline');
+    await mkdir(resumeDir, { recursive: true });
+    await command([
+      `${baseUrl}/fmp4.m3u8`,
+      join(tempRoot, 'fmp4-source.mp4'),
+      '--resume',
+      resumeDir,
+    ]);
+
+    const output = join(tempRoot, 'fmp4-offline.mp4');
+    const { stdout } = await commandBare(['--merge-only', resumeDir, output]);
+
+    expect(stdout).toContain('Done! Saved to');
+    expect((await readFile(output)).byteLength).toBeGreaterThan(0);
+  });
+
+  it('resumes fMP4 downloads and reuses the initialization segment', async () => {
+    const resumeDir = join(tempRoot, 'fmp4-resume');
+    await mkdir(resumeDir, { recursive: true });
+    await command([
+      `${baseUrl}/fmp4.m3u8`,
+      join(tempRoot, 'fmp4-resume-first.mp4'),
+      '--resume',
+      resumeDir,
+    ]);
+
+    const files = await readdir(resumeDir);
+    const segment = files.find(file => file.endsWith('.m4s'))!;
+    await rm(join(resumeDir, segment));
+
+    const { stdout } = await command([
+      `${baseUrl}/fmp4.m3u8`,
+      join(tempRoot, 'fmp4-resume-second.mp4'),
+      '--resume',
+      resumeDir,
+    ]);
+
+    expect(stdout).toContain('Resuming with 2/3 segments already downloaded');
+    expect(stdout).not.toContain('Downloading initialization segment');
+    expect(stdout).toContain('Done! Saved to');
+  });
+
+  it('rejects a non-fMP4 initialization segment', async () => {
+    const error = await command([`${baseUrl}/fmp4-bad.m3u8`, join(tempRoot, 'bad-fmp4.mp4')]).catch(
+      error => error,
+    );
 
     expect(error.code).toBe(1);
-    expect(error.stderr).toContain('Fragmented MP4 playlists');
+    expect(error.stderr).toContain('not a valid fragmented MP4 file');
   });
 
   it('rejects an HTML response served as a segment', async () => {

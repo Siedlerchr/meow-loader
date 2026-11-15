@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { parseM3U8, sortVariantsByBandwidth } from './src/m3u8-parser';
-import type { M3U8Playlist, M3U8Segment, M3U8Variant } from './src/m3u8-parser';
-import { downloadSegmentToFile } from './src/downloader';
+import type { M3U8Map, M3U8Playlist, M3U8Segment, M3U8Variant } from './src/m3u8-parser';
+import { downloadInitSegmentToFile, downloadSegmentToFile } from './src/downloader';
 import { abortActiveMerge, mergeToMp4 } from './src/merger';
+import type { HlsContainer } from './src/segment-validation';
 import {
   DEFAULT_MAX_SEGMENTS,
   DEFAULT_PLAYLIST_MAX_BYTES,
@@ -19,6 +20,7 @@ import {
   cleanupResumeState,
   initializeResumeState,
   loadResumeState,
+  recordInitSegment,
   recordSegment,
   saveResumeMetadata,
 } from './src/resume';
@@ -118,8 +120,8 @@ function validateMediaPlaylist(playlist: M3U8Playlist): number {
   if (!playlist.hasEndList) {
     throw new Error('Live or incomplete playlists are not supported (missing #EXT-X-ENDLIST)');
   }
-  if (playlist.hasMap) {
-    throw new Error('Fragmented MP4 playlists (#EXT-X-MAP) are not supported');
+  if (playlist.map?.byterange) {
+    throw new Error('Byte-range #EXT-X-MAP initialization segments are not supported');
   }
   if (playlist.hasByteRange) {
     throw new Error('Byte-range playlists (#EXT-X-BYTERANGE) are not supported');
@@ -289,27 +291,82 @@ async function downloadSegments(
   keyCache: Map<string, Buffer>,
   maxDownload: number,
   maxSegmentSize: number,
-): Promise<{ segmentPaths: string[]; totalBytes: number } | null> {
+  container: HlsContainer,
+  map: M3U8Map | undefined,
+): Promise<{ segmentPaths: string[]; initPath?: string; totalBytes: number } | null> {
   const segmentPaths: string[] = [];
-  const initialBytes = Object.values(resume.metadata.segments).reduce((sum, segment) => sum + segment.size, 0);
-  let totalBytes = initialBytes;
+  let initPath: string | undefined;
 
-  if (maxDownload > 0 && initialBytes > maxDownload) {
+  const initialSegmentBytes = Object.values(resume.metadata.segments).reduce(
+    (sum, segment) => sum + segment.size,
+    0,
+  );
+  const initialInitBytes = resume.metadata.initSegment?.size ?? 0;
+  let totalBytes = initialSegmentBytes + initialInitBytes;
+
+  if (maxDownload > 0 && totalBytes > maxDownload) {
     throw new DownloadLimitError(
-      `Existing segments total ${formatBytes(initialBytes)}, above the ${formatBytes(maxDownload)} limit. Raise it with --max-download.`,
+      `Existing segments total ${formatBytes(totalBytes)}, above the ${formatBytes(maxDownload)} limit. Raise it with --max-download.`,
     );
   }
+
+  const extension = container === 'fmp4' ? 'm4s' : 'ts';
+
+  if (map) {
+    const fileName = `init.${container === 'fmp4' ? 'mp4' : 'ts'}`;
+    initPath = join(tmpDir, fileName);
+
+    if (!resume.initValid || !resume.metadata.initSegment) {
+      if (maxDownload > 0 && totalBytes >= maxDownload) {
+        throw new DownloadLimitError(
+          `Download limit reached (${formatBytes(maxDownload)}). Resume later with: --resume ${tmpDir} --max-download ${formatBytes(maxDownload * 2)}`,
+        );
+      }
+
+      const remainingLimit = maxDownload > 0 ? maxDownload - totalBytes : Infinity;
+      const maxBytes = Math.min(maxSegmentSize, remainingLimit);
+
+      console.log('Downloading initialization segment...');
+      try {
+        const partialPath = join(workDir, `${fileName}.part`);
+        const result = await downloadInitSegmentToFile(map, playlistUrl, partialPath, {
+          network,
+          keyCache,
+          maxBytes,
+          container: 'fmp4',
+        });
+
+        await replaceSegmentFile(partialPath, initPath);
+
+        if (resume.persist) {
+          recordInitSegment(resume.metadata, fileName, result.size, result.sha256);
+          await saveResumeMetadata(tmpDir, resume.metadata, workDir);
+        }
+
+        totalBytes += result.size;
+      } catch (error) {
+        console.error('\nFailed to download the initialization segment.');
+        console.error(errorMessage(error));
+        console.log(`Resume later with: --resume ${tmpDir}`);
+        process.exitCode = 1;
+        return null;
+      }
+    }
+  }
+
   const progress = new DownloadProgress(
     segments.length,
-    initialBytes,
+    totalBytes,
     resume.completed.size,
     Boolean(stdin.isTTY),
   );
 
+  console.log(`Downloading ${segments.length} segments...`);
+
   try {
     for (let i = 0; i < segments.length; i++) {
       const segment = segments[i]!;
-      const fileName = `segment_${String(i).padStart(String(segments.length).length, '0')}.ts`;
+      const fileName = `segment_${String(i).padStart(String(segments.length).length, '0')}.${extension}`;
       const segmentPath = join(tmpDir, fileName);
 
       if (resume.completed.has(i)) {
@@ -352,6 +409,7 @@ async function downloadSegments(
             network,
             keyCache,
             maxBytes,
+            container,
             onProgress: bytes => progress.addBytes(bytes),
           });
 
@@ -406,7 +464,7 @@ async function downloadSegments(
       }
     }
 
-    return { segmentPaths, totalBytes };
+    return { segmentPaths, initPath, totalBytes };
   } finally {
     progress.finish();
     await rm(workDir, { recursive: true, force: true }).catch(() => {});
@@ -509,9 +567,15 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
   }
 
   console.log(`Validating segments in: ${dir}`);
-  const { metadata, completed } = await loadResumeState(dir);
+  const { metadata, completed, initValid } = await loadResumeState(dir);
+  const container: HlsContainer = metadata.container ?? 'mpegts';
   if (metadata.segmentCount === 0) {
     throw new Error(`No segments recorded in ${dir}`);
+  }
+  if (container === 'fmp4' && (!metadata.initSegment || !initValid)) {
+    throw new Error(
+      `Cannot merge ${dir}: the fMP4 initialization segment is missing or corrupt. Re-download with --resume ${dir} when the endpoint is available.`,
+    );
   }
 
   const missing: number[] = [];
@@ -527,15 +591,18 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
   }
 
   const segmentPaths: string[] = [];
-  let totalBytes = 0;
+  let totalBytes = metadata.initSegment?.size ?? 0;
   for (let index = 0; index < metadata.segmentCount; index++) {
     const segment = metadata.segments[String(index)]!;
     segmentPaths.push(join(dir, segment.fileName));
     totalBytes += segment.size;
   }
 
+  const initPath = metadata.initSegment ? join(dir, metadata.initSegment.fileName) : undefined;
+
   if (args.dryRun) {
     console.log(`Segments: ${metadata.segmentCount}`);
+    console.log(`Container: ${container === 'fmp4' ? 'fMP4' : 'MPEG-TS'}`);
     if (metadata.durationSeconds !== undefined) {
       console.log(`Duration: ${formatDuration(metadata.durationSeconds)}`);
     }
@@ -564,8 +631,9 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
   });
 
   console.log(`Merging ${formatBytes(totalBytes)} from ${metadata.segmentCount} segments...`);
+  const mergePaths = initPath ? [initPath, ...segmentPaths] : segmentPaths;
   try {
-    await mergeToMp4(segmentPaths, partialOutput);
+    await mergeToMp4(mergePaths, partialOutput, { container });
     console.log('Verifying output...');
     await validateMp4Output(partialOutput, metadata.durationSeconds);
     await assertOutputAvailable(output, args.force);
@@ -692,12 +760,15 @@ async function main(): Promise<void> {
 
   const expectedDuration = validateMediaPlaylist(playlist);
   const segments = playlist.segments!;
+  const container: HlsContainer = playlist.map ? 'fmp4' : 'mpegts';
+  const map = playlist.map;
   const estimatedBytes = selectedVariant
     ? estimateBytes(selectedVariant.bandwidth, expectedDuration)
     : undefined;
 
   if (args.dryRun) {
     console.log(`Segments: ${segments.length}`);
+    console.log(`Container: ${container === 'fmp4' ? 'fMP4' : 'MPEG-TS'}`);
     console.log(`Duration: ${formatDuration(expectedDuration)}`);
     if (estimatedBytes !== undefined) {
       console.log(`Estimated size: ~${formatBytes(estimatedBytes)} (bandwidth-based)`);
@@ -740,13 +811,14 @@ async function main(): Promise<void> {
     segments,
     persist: true,
     tempDir: workDir,
+    container,
+    map,
   });
 
   console.log(`Working dir: ${tmpDir}`);
   if (resume.completed.size > 0) {
     console.log(`Resuming with ${resume.completed.size}/${segments.length} segments already downloaded`);
   }
-  console.log(`Downloading ${segments.length} segments...`);
 
   let outputTempDir: string | undefined;
 
@@ -770,6 +842,8 @@ async function main(): Promise<void> {
     new Map(),
     maxDownload,
     args.maxSegmentSize,
+    container,
+    map,
   );
   if (!result) {
     return;
@@ -791,8 +865,11 @@ async function main(): Promise<void> {
   const partialOutput = join(outputTempDir, basename(finalOutput.path));
 
   console.log(`\nMerging ${formatBytes(result.totalBytes)} into MP4...`);
+  const mergePaths = result.initPath
+    ? [result.initPath, ...result.segmentPaths]
+    : result.segmentPaths;
   try {
-    await mergeToMp4(result.segmentPaths, partialOutput);
+    await mergeToMp4(mergePaths, partialOutput, { container });
     console.log('Verifying output...');
     await validateMp4Output(partialOutput, expectedDuration);
     await assertOutputAvailable(finalOutput.path, args.force);

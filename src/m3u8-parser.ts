@@ -13,6 +13,17 @@ export interface M3U8Encryption {
   iv?: string;
 }
 
+export interface M3U8ByteRange {
+  length: number;
+  offset?: number;
+}
+
+export interface M3U8Map {
+  uri: string;
+  byterange?: M3U8ByteRange;
+  encryption?: M3U8Encryption;
+}
+
 export interface M3U8Playlist {
   isMaster: boolean;
   variants?: M3U8Variant[];
@@ -21,6 +32,7 @@ export interface M3U8Playlist {
   mediaSequence: number;
   hasEndList: boolean;
   hasMap: boolean;
+  map?: M3U8Map;
   hasByteRange: boolean;
   separateAudioGroups: string[];
 }
@@ -136,6 +148,35 @@ export function parseM3U8(content: string): M3U8Playlist {
     }
 
     if (line.startsWith('#EXT-X-MAP')) {
+      const separator = line.indexOf(':');
+      const attrs = separator === -1 ? {} : parseAttributes(line.slice(separator + 1));
+      const uri = attrs.URI;
+      if (!uri) {
+        throw new Error('Invalid M3U8 file: #EXT-X-MAP is missing the URI attribute');
+      }
+      if (!isSupportedKeyUri(uri)) {
+        throw new Error(
+          'Unsupported #EXT-X-MAP URI (only HTTP(S) and relative URLs are supported)',
+        );
+      }
+
+      const map: M3U8Map = {
+        uri,
+        ...(attrs.BYTERANGE ? { byterange: parseByteRange(attrs.BYTERANGE) } : {}),
+        ...(currentEncryption ? { encryption: { ...currentEncryption } } : {}),
+      };
+
+      if (playlist.map) {
+        if (!sameMap(playlist.map, map)) {
+          throw new Error('Changing the initialization segment mid-playlist is not supported');
+        }
+      } else {
+        if (playlist.segments && playlist.segments.length > 0) {
+          throw new Error('Initialization segments after media segments are not supported');
+        }
+        playlist.map = map;
+      }
+
       playlist.hasMap = true;
       continue;
     }
@@ -225,6 +266,29 @@ function isSupportedKeyUri(uri: string): boolean {
     return /^https?:/i.test(uri);
   }
   return true;
+}
+
+function parseByteRange(value: string): M3U8ByteRange {
+  const match = /^(\d+)(?:@(\d+))?$/.exec(value.trim());
+  if (!match) {
+    throw new Error('Invalid #EXT-X-BYTERANGE value');
+  }
+
+  const length = Number(match[1]);
+  const offset = match[2] === undefined ? undefined : Number(match[2]);
+  if (
+    !Number.isSafeInteger(length) ||
+    length <= 0 ||
+    (offset !== undefined && !Number.isSafeInteger(offset))
+  ) {
+    throw new Error('Invalid #EXT-X-BYTERANGE value');
+  }
+
+  return { length, ...(offset !== undefined ? { offset } : {}) };
+}
+
+function sameMap(a: M3U8Map, b: M3U8Map): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 function parseAttributes(str: string): Record<string, string | undefined> {

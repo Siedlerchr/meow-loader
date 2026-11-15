@@ -2,14 +2,21 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { lstat, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { M3U8Segment } from './m3u8-parser';
-import { scanMpegTsFile } from './segment-validation';
+import type { M3U8Map, M3U8Segment } from './m3u8-parser';
+import { scanSegmentFile } from './segment-validation';
+import type { HlsContainer } from './segment-validation';
 import { redactUrl } from './url';
 
 export const RESUME_METADATA_FILENAME = 'meow-loader.resume.json';
 const RESUME_VERSION = 2;
 
 export interface ResumeSegment {
+  fileName: string;
+  size: number;
+  sha256: string;
+}
+
+export interface ResumeInitSegment {
   fileName: string;
   size: number;
   sha256: string;
@@ -24,6 +31,10 @@ export interface ResumeMetadata {
   segmentCount: number;
   segmentFingerprint: string;
   segments: Record<string, ResumeSegment>;
+  /** Optional for directories created before fMP4 support. */
+  container?: HlsContainer;
+  /** Present for fMP4 playlists that declare #EXT-X-MAP. */
+  initSegment?: ResumeInitSegment;
   /** Optional for directories created before this field existed. */
   durationSeconds?: number;
 }
@@ -31,6 +42,7 @@ export interface ResumeMetadata {
 export interface ResumeState {
   metadata: ResumeMetadata;
   completed: Set<number>;
+  initValid: boolean;
   persist: boolean;
 }
 
@@ -41,30 +53,45 @@ export async function initializeResumeState(options: {
   segments: M3U8Segment[];
   persist: boolean;
   tempDir?: string;
+  container: HlsContainer;
+  map?: M3U8Map;
 }): Promise<ResumeState> {
-  const expected = createMetadata(options.sourceUrl, options.mediaPlaylistUrl, options.segments);
+  const expected = createMetadata(
+    options.sourceUrl,
+    options.mediaPlaylistUrl,
+    options.segments,
+    options.container,
+    options.map,
+  );
 
   if (!options.persist) {
-    return { metadata: expected, completed: new Set(), persist: false };
+    return { metadata: expected, completed: new Set(), initValid: false, persist: false };
   }
 
   const metadataPath = join(options.dir, RESUME_METADATA_FILENAME);
   if (existsSync(metadataPath)) {
     const existing = parseMetadata(await readFile(metadataPath, 'utf8'), metadataPath);
     assertSamePlaylist(existing, expected);
+    if (existing.container && existing.container !== expected.container) {
+      throw new Error(
+        `Resume directory holds ${existing.container} segments, but this playlist is ${expected.container}`,
+      );
+    }
     expected.segments = existing.segments;
+    expected.initSegment = existing.initSegment;
   }
 
   await saveResumeMetadata(options.dir, expected, options.tempDir);
-  const completed = await validateCompletedSegments(options.dir, expected);
+  const { completed, initValid } = await validateCompletedSegments(options.dir, expected);
   await saveResumeMetadata(options.dir, expected, options.tempDir);
 
-  return { metadata: expected, completed, persist: true };
+  return { metadata: expected, completed, initValid, persist: true };
 }
 
 export interface LoadedResumeState {
   metadata: ResumeMetadata;
   completed: Set<number>;
+  initValid: boolean;
 }
 
 /**
@@ -87,8 +114,8 @@ export async function loadResumeState(dir: string): Promise<LoadedResumeState> {
   }
 
   const metadata = parseMetadata(raw, metadataPath);
-  const completed = await validateCompletedSegments(dir, metadata);
-  return { metadata, completed };
+  const { completed, initValid } = await validateCompletedSegments(dir, metadata);
+  return { metadata, completed, initValid };
 }
 
 export function recordSegment(
@@ -99,6 +126,15 @@ export function recordSegment(
   sha256: string,
 ): void {
   metadata.segments[String(index)] = { fileName, size, sha256 };
+}
+
+export function recordInitSegment(
+  metadata: ResumeMetadata,
+  fileName: string,
+  size: number,
+  sha256: string,
+): void {
+  metadata.initSegment = { fileName, size, sha256 };
 }
 
 export async function saveResumeMetadata(
@@ -119,6 +155,11 @@ export async function cleanupResumeState(dir: string, metadata: ResumeMetadata):
     await rm(join(dir, `${segment.fileName}.part`), { force: true });
   }
 
+  if (metadata.initSegment) {
+    await rm(join(dir, metadata.initSegment.fileName), { force: true });
+    await rm(join(dir, `${metadata.initSegment.fileName}.part`), { force: true });
+  }
+
   await rm(join(dir, RESUME_METADATA_FILENAME), { force: true });
 }
 
@@ -126,6 +167,8 @@ function createMetadata(
   sourceUrl: string,
   mediaPlaylistUrl: string,
   segments: M3U8Segment[],
+  container: HlsContainer,
+  map: M3U8Map | undefined,
 ): ResumeMetadata {
   return {
     version: RESUME_VERSION,
@@ -134,8 +177,9 @@ function createMetadata(
     sourceDisplay: redactUrl(sourceUrl),
     mediaPlaylistUrlDisplay: redactUrl(mediaPlaylistUrl),
     segmentCount: segments.length,
-    segmentFingerprint: fingerprintSegments(segments),
+    segmentFingerprint: fingerprintSegments(segments, map),
     segments: {},
+    container,
     durationSeconds: segments.reduce((sum, segment) => sum + segment.duration, 0),
   };
 }
@@ -179,13 +223,37 @@ function parseMetadata(raw: string, path: string): ResumeMetadata {
     throw invalidMetadataError(path);
   }
 
+  if (
+    candidate.container !== undefined &&
+    candidate.container !== 'mpegts' &&
+    candidate.container !== 'fmp4'
+  ) {
+    throw invalidMetadataError(path);
+  }
+
+  if (candidate.initSegment !== undefined) {
+    const init = candidate.initSegment;
+    if (
+      !init ||
+      typeof init !== 'object' ||
+      typeof init.fileName !== 'string' ||
+      !/^init\.(?:mp4|m4s)$/.test(init.fileName) ||
+      !Number.isInteger(init.size) ||
+      init.size < 0 ||
+      typeof init.sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(init.sha256)
+    ) {
+      throw invalidMetadataError(path);
+    }
+  }
+
   for (const [key, value] of Object.entries(candidate.segments)) {
     if (
       !/^\d+$/.test(key) ||
       !value ||
       typeof value !== 'object' ||
       typeof value.fileName !== 'string' ||
-      !/^segment_\d+\.ts$/.test(value.fileName) ||
+      !/^segment_\d+\.(?:ts|m4s)$/.test(value.fileName) ||
       !Number.isInteger(value.size) ||
       value.size < 0 ||
       typeof value.sha256 !== 'string' ||
@@ -228,8 +296,34 @@ function assertSamePlaylist(actual: ResumeMetadata, expected: ResumeMetadata): v
   }
 }
 
-async function validateCompletedSegments(dir: string, metadata: ResumeMetadata): Promise<Set<number>> {
+async function validateCompletedSegments(
+  dir: string,
+  metadata: ResumeMetadata,
+): Promise<{ completed: Set<number>; initValid: boolean }> {
   const completed = new Set<number>();
+  const container = metadata.container ?? 'mpegts';
+
+  let initValid = false;
+  const init = metadata.initSegment;
+  if (init) {
+    const initPath = join(dir, init.fileName);
+    const info = await lstat(initPath).catch(() => undefined);
+
+    if (!info?.isFile() || info.isSymbolicLink() || info.size !== init.size) {
+      await rm(initPath, { force: true });
+      delete metadata.initSegment;
+    } else {
+      const scan = await scanSegmentFile(initPath, container, { requireFtyp: true }).catch(
+        () => undefined,
+      );
+      if (!scan || !scan.valid || scan.size !== init.size || scan.sha256 !== init.sha256) {
+        await rm(initPath, { force: true });
+        delete metadata.initSegment;
+      } else {
+        initValid = true;
+      }
+    }
+  }
 
   for (const [key, segment] of Object.entries(metadata.segments)) {
     const index = Number(key);
@@ -247,7 +341,7 @@ async function validateCompletedSegments(dir: string, metadata: ResumeMetadata):
       continue;
     }
 
-    const scan = await scanMpegTsFile(path).catch(() => undefined);
+    const scan = await scanSegmentFile(path, container).catch(() => undefined);
     if (!scan || !scan.valid || scan.size !== segment.size || scan.sha256 !== segment.sha256) {
       await rm(path, { force: true });
       delete metadata.segments[key];
@@ -257,10 +351,10 @@ async function validateCompletedSegments(dir: string, metadata: ResumeMetadata):
     completed.add(index);
   }
 
-  return completed;
+  return { completed, initValid };
 }
 
-function fingerprintSegments(segments: M3U8Segment[]): string {
+function fingerprintSegments(segments: M3U8Segment[], map: M3U8Map | undefined): string {
   const payload = segments.map(segment => ({
     duration: segment.duration,
     sequence: segment.sequence,
@@ -273,7 +367,25 @@ function fingerprintSegments(segments: M3U8Segment[]): string {
       : null,
   }));
 
-  return hashString(JSON.stringify(payload));
+  // Keep the fingerprint of MPEG-TS playlists byte-identical to earlier
+  // versions so existing resume directories remain usable.
+  const serialized = JSON.stringify(payload);
+  if (!map) {
+    return hashString(serialized);
+  }
+
+  const mapIdentity = {
+    uri: stripQuery(map.uri),
+    byterange: map.byterange ?? null,
+    encryption: map.encryption
+      ? {
+          uri: stripQuery(map.encryption.uri),
+          iv: map.encryption.iv ?? null,
+        }
+      : null,
+  };
+
+  return hashString(`${serialized}\n${JSON.stringify(mapIdentity)}`);
 }
 
 function hashUrl(url: string): string {

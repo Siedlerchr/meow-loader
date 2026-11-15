@@ -249,8 +249,9 @@ need `--allow-insecure`.
 - Select the highest-bandwidth variant by default
 - Interactive variant selection for master playlists
 - AES-128 encrypted HLS support, including key rotation and default IVs
+- MPEG-TS and fMP4/CMAF segments, including a single `#EXT-X-MAP` init segment
 - Streamed segment downloads with incremental SHA-256 hashing
-- MPEG-TS validation and ffprobe duration verification before replacing output
+- Segment container validation and ffprobe duration verification before replacing output
 - Resume interrupted downloads without treating partial files as complete
 - Merge segments into a single MP4 via ffmpeg
 - Per-origin header scoping, SSRF protection, and request timeouts
@@ -259,8 +260,9 @@ need `--allow-insecure`.
 
 - DRM-protected streams (Widevine, FairPlay, etc.) are not supported.
 - `SAMPLE-AES` and `SAMPLE-AES-CTR` encryption are not supported.
-- Fragmented MP4 playlists using `#EXT-X-MAP` are not supported.
 - Byte-range playlists using `#EXT-X-BYTERANGE` are not supported.
+- Byte-range `#EXT-X-MAP` initialization segments are not supported.
+- Changing the `#EXT-X-MAP` initialization segment mid-playlist is not supported.
 - Live playlists (missing `#EXT-X-ENDLIST`) are not supported.
 - Variants that reference a separate audio rendition
   (`#EXT-X-MEDIA:TYPE=AUDIO` with a URI) are not supported.

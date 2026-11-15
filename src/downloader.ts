@@ -3,12 +3,13 @@ import { createWriteStream } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import type { M3U8Segment } from './m3u8-parser';
+import type { M3U8Encryption, M3U8Map, M3U8Segment } from './m3u8-parser';
 import { formatBytes } from './display';
 import { SegmentLimitError } from './errors';
 import type { NetworkClient } from './network';
 import { readResponseBytes } from './network';
-import { MpegTsValidator } from './segment-validation';
+import { createSegmentValidator } from './segment-validation';
+import type { HlsContainer } from './segment-validation';
 import { redactUrl } from './url';
 
 const HEADER_TIMEOUT_MS = 120_000;
@@ -18,6 +19,7 @@ export interface DownloadSegmentOptions {
   network: NetworkClient;
   keyCache: Map<string, Buffer>;
   maxBytes: number;
+  container: HlsContainer;
   onProgress?: (bytes: number) => void;
 }
 
@@ -33,13 +35,64 @@ export async function downloadSegmentToFile(
   options: DownloadSegmentOptions,
 ): Promise<DownloadedSegment> {
   const url = resolveUrl(segment.uri, baseUrl);
+  const iv = segment.encryption
+    ? segment.encryption.iv
+      ? parseIv(segment.encryption.iv)
+      : ivFromSequence(segment.sequence)
+    : undefined;
+
+  return downloadFile(url, baseUrl, destination, options, {
+    encryption: segment.encryption,
+    iv,
+    label: 'segment',
+  });
+}
+
+export async function downloadInitSegmentToFile(
+  map: M3U8Map,
+  baseUrl: string,
+  destination: string,
+  options: DownloadSegmentOptions,
+): Promise<DownloadedSegment> {
+  const url = resolveUrl(map.uri, baseUrl);
+  let iv: Uint8Array | undefined;
+
+  if (map.encryption) {
+    if (!map.encryption.iv) {
+      throw new Error('Encrypted initialization segments require an explicit #EXT-X-KEY IV');
+    }
+    iv = parseIv(map.encryption.iv);
+  }
+
+  return downloadFile(url, baseUrl, destination, options, {
+    encryption: map.encryption,
+    iv,
+    label: 'initialization segment',
+    requireFtyp: true,
+  });
+}
+
+interface DownloadFileSpec {
+  encryption?: M3U8Encryption;
+  iv?: Uint8Array;
+  label: string;
+  requireFtyp?: boolean;
+}
+
+async function downloadFile(
+  url: string,
+  baseUrl: string,
+  destination: string,
+  options: DownloadSegmentOptions,
+  spec: DownloadFileSpec,
+): Promise<DownloadedSegment> {
   const controller = new AbortController();
   const headerTimer = setTimeout(() => controller.abort(), HEADER_TIMEOUT_MS);
 
   let response: Response;
   try {
     response = await options.network.fetch(url, {}, {
-      label: 'segment',
+      label: spec.label,
       signal: controller.signal,
       timeoutMs: 0,
     });
@@ -48,17 +101,17 @@ export async function downloadSegmentToFile(
   }
 
   if (!response.ok) {
-    throw new Error(`Failed to download segment: ${redactUrl(url)} (${response.status})`);
+    throw new Error(`Failed to download ${spec.label}: ${redactUrl(url)} (${response.status})`);
   }
   if (!response.body) {
-    throw new Error(`Segment response has no body: ${redactUrl(url)}`);
+    throw new Error(`The ${spec.label} response has no body: ${redactUrl(url)}`);
   }
 
   const contentLength = Number(response.headers.get('content-length'));
   if (Number.isFinite(contentLength) && contentLength > options.maxBytes) {
     await response.body.cancel();
     throw new SegmentLimitError(
-      `Segment is ${formatBytes(contentLength)}, above the ${formatBytes(options.maxBytes)} limit. Use --max-segment-size or --max-download to raise it.`,
+      `The ${spec.label} is ${formatBytes(contentLength)}, above the ${formatBytes(options.maxBytes)} limit. Use --max-segment-size or --max-download to raise it.`,
     );
   }
 
@@ -66,10 +119,9 @@ export async function downloadSegmentToFile(
     response.body as import('node:stream/web').ReadableStream<Uint8Array>,
   );
 
-  if (segment.encryption) {
-    const key = await getKey(segment, baseUrl, options);
-    const iv = segment.encryption.iv ? parseIv(segment.encryption.iv) : ivFromSequence(segment.sequence);
-    stream = stream.pipe(createDecipheriv('aes-128-cbc', key, Buffer.from(iv)));
+  if (spec.encryption) {
+    const key = await getKey(spec.encryption, baseUrl, options);
+    stream = stream.pipe(createDecipheriv('aes-128-cbc', key, Buffer.from(spec.iv!)));
   }
 
   let inactivityTimer = setTimeout(() => controller.abort(), INACTIVITY_TIMEOUT_MS);
@@ -79,7 +131,9 @@ export async function downloadSegmentToFile(
   };
 
   const hash = createHash('sha256');
-  const validator = new MpegTsValidator();
+  const validator = createSegmentValidator(options.container, {
+    requireFtyp: spec.requireFtyp,
+  });
   let size = 0;
 
   const inspector = new Transform({
@@ -90,7 +144,7 @@ export async function downloadSegmentToFile(
       if (size > options.maxBytes) {
         callback(
           new SegmentLimitError(
-            `Segment is above the ${formatBytes(options.maxBytes)} limit. Use --max-segment-size or --max-download to raise it.`,
+            `The ${spec.label} is above the ${formatBytes(options.maxBytes)} limit. Use --max-segment-size or --max-download to raise it.`,
           ),
         );
         return;
@@ -98,7 +152,7 @@ export async function downloadSegmentToFile(
 
       hash.update(chunk);
       if (!validator.update(chunk)) {
-        callback(new Error('Downloaded segment is not a valid MPEG-TS segment'));
+        callback(new Error(validityError(spec.label, options.container)));
         return;
       }
 
@@ -122,10 +176,16 @@ export async function downloadSegmentToFile(
 
   if (!validator.valid) {
     await rm(destination, { force: true }).catch(() => {});
-    throw new Error('Downloaded segment is not a valid MPEG-TS segment');
+    throw new Error(validityError(spec.label, options.container));
   }
 
   return { size, sha256: hash.digest('hex') };
+}
+
+function validityError(label: string, container: HlsContainer): string {
+  return container === 'fmp4'
+    ? `Downloaded ${label} is not a valid fragmented MP4 file`
+    : `Downloaded ${label} is not a valid MPEG-TS segment`;
 }
 
 export function resolveUrl(uri: string, baseUrl: string): string {
@@ -160,15 +220,10 @@ export function ivFromSequence(sequence: number): Uint8Array {
 }
 
 async function getKey(
-  segment: M3U8Segment,
+  encryption: M3U8Encryption,
   baseUrl: string,
   options: DownloadSegmentOptions,
 ): Promise<Buffer> {
-  const encryption = segment.encryption;
-  if (!encryption) {
-    throw new Error('Missing encryption information for segment');
-  }
-
   const keyUrl = resolveUrl(encryption.uri, baseUrl);
   const cached = options.keyCache.get(keyUrl);
   if (cached) {

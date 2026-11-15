@@ -90,6 +90,7 @@ describe('AES-128 segment download', () => {
       network: network(),
       keyCache,
       maxBytes: 1024 * 1024,
+      container: 'mpegts',
     });
     return readFile(destination);
   }
