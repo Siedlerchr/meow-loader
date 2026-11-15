@@ -23,9 +23,9 @@
 
 ## Release
 
-- [ ] Final README/limitations pass
-- [ ] Green CI on all platforms
-- [ ] Cut 1.0.0
+- [x] Final README/limitations pass
+- [x] Green CI on all platforms
+- [x] Cut 1.0.0
 
 ## Post-1.0
 
