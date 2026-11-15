@@ -1233,6 +1233,18 @@ media/all.mp4
     expect(error.stderr).toMatch(/Request failed|abort/i);
   });
 
+  it('rejects rendition flags with --merge-only', async () => {
+    const error = await commandBare([
+      '--merge-only',
+      join(tempRoot, 'unused'),
+      '--subtitle',
+      '0',
+    ]).catch(error => error);
+
+    expect(error.code).toBe(1);
+    expect(error.stderr).toContain('cannot be used with --merge-only');
+  });
+
   it('downloads a subtitle sidecar', async () => {
     subtitleRequests = [];
     const info = await command([`${baseUrl}/subtitle-master.m3u8`, '--dry-run']);

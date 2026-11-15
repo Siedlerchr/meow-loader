@@ -1147,6 +1147,12 @@ async function main(): Promise<void> {
   if (args.mergeDir && args.resumeDir) {
     throw new Error('--merge-only cannot be combined with --resume');
   }
+  if (
+    args.mergeDir &&
+    (args.audio !== undefined || args.audioLanguage !== undefined || args.subtitle !== undefined)
+  ) {
+    throw new Error('--audio, --audio-language, and --subtitle cannot be used with --merge-only');
+  }
   if (args.maxSegmentSize <= 0) {
     throw new Error('--max-segment-size must be greater than 0');
   }

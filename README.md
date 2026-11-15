@@ -300,7 +300,7 @@ older version, the segments are still in the printed `Working dir:` — re-run
 with `--resume <dir>` and a different output name, or with `--force`.
 
 **The playlist endpoint is gone.** If the working directory still contains
-`meow-loader.resume.json` and `segment_*.ts`, merge it without any network
+`meow-loader.resume.json` and the recorded segment files, merge it without any network
 access:
 
 ```bash
