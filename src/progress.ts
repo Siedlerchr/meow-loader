@@ -250,3 +250,65 @@ export class ParallelDownloadProgress {
     this.lastSampleBytes = this.bytes;
   }
 }
+
+/**
+ * Progress display while validating existing resume segments. Hashing a large
+ * directory can take minutes, so show how many files and bytes were checked.
+ */
+export class ValidationProgress {
+  private readonly totalFiles: number;
+  private readonly totalBytes: number;
+  private readonly tty: boolean;
+  private checkedFiles = 0;
+  private checkedBytes = 0;
+  private lastRenderAt = 0;
+  private lastLogAt = 0;
+  private hasRendered = false;
+
+  constructor(totalFiles: number, totalBytes: number, tty: boolean) {
+    this.totalFiles = totalFiles;
+    this.totalBytes = totalBytes;
+    this.tty = tty;
+  }
+
+  update(checkedFiles: number, checkedBytes: number): void {
+    this.checkedFiles = checkedFiles;
+    this.checkedBytes = checkedBytes;
+    const now = Date.now();
+
+    if (this.tty) {
+      if (now - this.lastRenderAt >= 250 || checkedFiles >= this.totalFiles) {
+        this.render();
+      }
+      return;
+    }
+
+    if (
+      checkedFiles >= this.totalFiles ||
+      checkedFiles % 100 === 0 ||
+      now - this.lastLogAt >= 5_000
+    ) {
+      this.render();
+      this.lastLogAt = now;
+    }
+  }
+
+  finish(): void {
+    if (this.tty && this.hasRendered) {
+      process.stdout.write('\n');
+    }
+  }
+
+  private render(): void {
+    const line = `Validating existing segments ${this.checkedFiles}/${this.totalFiles} files · ${formatBytes(this.checkedBytes)} / ${formatBytes(this.totalBytes)}`;
+
+    if (this.tty) {
+      process.stdout.write(`\r${line}\x1b[K`);
+      this.hasRendered = true;
+    } else {
+      console.log(line);
+    }
+
+    this.lastRenderAt = Date.now();
+  }
+}

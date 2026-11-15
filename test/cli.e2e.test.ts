@@ -1007,8 +1007,9 @@ media/all.mp4
     await copyFile(join(fixtures, 'segments', 'segment_001_blue.ts'), join(resumeDir, 'segment_0.ts'));
 
     segmentRequests = [];
-    await command([`${baseUrl}/media.m3u8`, secondOutput, '--resume', resumeDir]);
+    const { stdout } = await command([`${baseUrl}/media.m3u8`, secondOutput, '--resume', resumeDir]);
 
+    expect(stdout).toContain('Validating existing segments 3/3 files');
     expect(segmentRequests).toEqual(['/segments/segment_000_red.ts']);
     expect((await readFile(secondOutput)).byteLength).toBeGreaterThan(0);
   });
@@ -1373,6 +1374,33 @@ media/all.mp4
 
     expect(error.code).toBe(1);
     expect(error.stderr).toMatch(/limit/i);
+  });
+
+  it('persists all segment records in parallel mode', async () => {
+    const resumeDir = join(tempRoot, 'parallel-resume');
+    await mkdir(resumeDir, { recursive: true });
+
+    await command([
+      `${baseUrl}/slow.m3u8`,
+      join(tempRoot, 'parallel-first.mp4'),
+      '--resume',
+      resumeDir,
+      '--concurrency',
+      '3',
+    ]);
+
+    const { stdout } = await command([
+      `${baseUrl}/slow.m3u8`,
+      join(tempRoot, 'parallel-second.mp4'),
+      '--resume',
+      resumeDir,
+      '--concurrency',
+      '3',
+    ]);
+
+    expect(stdout).toContain('Resuming with 3/3 segments already downloaded');
+    expect(stdout).toContain('Validating existing segments 3/3 files');
+    expect(stdout).toContain('Done! Saved to');
   });
 
   it('downloads segments sequentially by default', async () => {

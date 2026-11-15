@@ -59,6 +59,15 @@ export interface ResumeTrackInput {
   map?: M3U8Map;
 }
 
+export interface ResumeValidationState {
+  checkedFiles: number;
+  totalFiles: number;
+  checkedBytes: number;
+  totalBytes: number;
+}
+
+export type ResumeValidationCallback = (state: ResumeValidationState) => void;
+
 export async function initializeResumeState(options: {
   dir: string;
   sourceUrl: string;
@@ -66,6 +75,7 @@ export async function initializeResumeState(options: {
   tempDir?: string;
   video: ResumeTrackInput;
   audio?: ResumeTrackInput;
+  onValidate?: ResumeValidationCallback;
 }): Promise<ResumeState> {
   const expected: ResumeMetadata = {
     version: RESUME_VERSION,
@@ -118,8 +128,14 @@ export async function initializeResumeState(options: {
   }
 
   await saveResumeMetadata(options.dir, expected, options.tempDir);
-  const video = await validateTrack(options.dir, expected);
-  const audio = expected.audio ? await validateTrack(options.dir, expected.audio) : undefined;
+  const onFile = createValidationReporter(
+    expected.audio ? [expected, expected.audio] : [expected],
+    options.onValidate,
+  );
+  const video = await validateTrack(options.dir, expected, onFile);
+  const audio = expected.audio
+    ? await validateTrack(options.dir, expected.audio, onFile)
+    : undefined;
   await saveResumeMetadata(options.dir, expected, options.tempDir);
 
   return {
@@ -140,7 +156,10 @@ export interface LoadedResumeState extends ResumeTrackState {
  * Load and validate a resume directory without a playlist. Used by
  * --merge-only when the original endpoint is no longer available.
  */
-export async function loadResumeState(dir: string): Promise<LoadedResumeState> {
+export async function loadResumeState(
+  dir: string,
+  onValidate?: ResumeValidationCallback,
+): Promise<LoadedResumeState> {
   const metadataPath = join(dir, RESUME_METADATA_FILENAME);
   let raw: string;
 
@@ -156,8 +175,12 @@ export async function loadResumeState(dir: string): Promise<LoadedResumeState> {
   }
 
   const metadata = parseMetadata(raw, metadataPath);
-  const video = await validateTrack(dir, metadata);
-  const audio = metadata.audio ? await validateTrack(dir, metadata.audio) : undefined;
+  const onFile = createValidationReporter(
+    metadata.audio ? [metadata, metadata.audio] : [metadata],
+    onValidate,
+  );
+  const video = await validateTrack(dir, metadata, onFile);
+  const audio = metadata.audio ? await validateTrack(dir, metadata.audio, onFile) : undefined;
 
   return {
     metadata,
@@ -408,13 +431,52 @@ function assertSameTrack(
   }
 }
 
-async function validateTrack(dir: string, track: ResumeTrack): Promise<ResumeTrackState> {
+function trackTotals(track: ResumeTrack): { files: number; bytes: number } {
+  let files = track.initSegment ? 1 : 0;
+  let bytes = track.initSegment?.size ?? 0;
+
+  for (const segment of Object.values(track.segments)) {
+    files++;
+    bytes += segment.size;
+  }
+
+  return { files, bytes };
+}
+
+function createValidationReporter(
+  tracks: ResumeTrack[],
+  onValidate?: ResumeValidationCallback,
+): (size: number) => void {
+  let totalFiles = 0;
+  let totalBytes = 0;
+  for (const track of tracks) {
+    const totals = trackTotals(track);
+    totalFiles += totals.files;
+    totalBytes += totals.bytes;
+  }
+
+  let checkedFiles = 0;
+  let checkedBytes = 0;
+
+  return (size: number) => {
+    checkedFiles++;
+    checkedBytes += size;
+    onValidate?.({ checkedFiles, totalFiles, checkedBytes, totalBytes });
+  };
+}
+
+async function validateTrack(
+  dir: string,
+  track: ResumeTrack,
+  onFile?: (size: number) => void,
+): Promise<ResumeTrackState> {
   const completed = new Set<number>();
   const container = track.container ?? 'mpegts';
 
   let initValid = false;
   const init = track.initSegment;
   if (init) {
+    onFile?.(init.size);
     const initPath = join(dir, init.fileName);
     const info = await lstat(initPath).catch(() => undefined);
 
@@ -435,6 +497,7 @@ async function validateTrack(dir: string, track: ResumeTrack): Promise<ResumeTra
   }
 
   for (const [key, segment] of Object.entries(track.segments)) {
+    onFile?.(segment.size);
     const index = Number(key);
     const path = join(dir, segment.fileName);
 

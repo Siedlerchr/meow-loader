@@ -29,7 +29,11 @@ import { formatBytes, formatDuration, sanitizeForDisplay, sanitizeMultiline } fr
 import { DiskSpaceError, DownloadLimitError, SegmentLimitError } from './src/errors';
 import { NetworkClient, readResponseBytes, readResponseText, UrlPolicyError } from './src/network';
 import { getUniqueFilePath, pickAvailableOutputPath } from './src/output-path';
-import { DownloadProgress, ParallelDownloadProgress } from './src/progress';
+import {
+  DownloadProgress,
+  ParallelDownloadProgress,
+  ValidationProgress,
+} from './src/progress';
 import { validateMp4Output } from './src/output-validation';
 import { isValidWebVttSegment, mergeWebVttSegments } from './src/webvtt';
 import {
@@ -42,7 +46,13 @@ import {
   recordSegment,
   saveResumeMetadata,
 } from './src/resume';
-import type { ResumeMetadata, ResumeState, ResumeTrack } from './src/resume';
+import type {
+  LoadedResumeState,
+  ResumeMetadata,
+  ResumeState,
+  ResumeTrack,
+  ResumeValidationCallback,
+} from './src/resume';
 import { redactUrl } from './src/url';
 import readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
@@ -514,19 +524,59 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
     reservedBytes -= slice;
   };
 
+  const METADATA_BATCH_INTERVAL_MS = 500;
+  const METADATA_BATCH_MAX_RECORDS = 32;
   let saveChain: Promise<void> = Promise.resolve();
   let saveError: unknown;
-  const persist = async (): Promise<void> => {
+  let pendingRecords = 0;
+  let saveTimer: NodeJS.Timeout | undefined;
+
+  const queueMetadataWrite = async (throwOnError: boolean): Promise<void> => {
     saveChain = saveChain.then(async () => {
       if (saveError) return;
       try {
         await saveResumeMetadata(tmpDir, options.metadata, trackWorkDir);
       } catch (error) {
         saveError = error;
-        throw error;
+        if (throwOnError) {
+          throw error;
+        }
       }
     });
     await saveChain;
+  };
+
+  const flushPending = async (): Promise<void> => {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = undefined;
+    }
+    if (pendingRecords === 0) {
+      return;
+    }
+    pendingRecords = 0;
+    await queueMetadataWrite(false);
+  };
+
+  const persist = async (): Promise<void> => {
+    if (concurrency === 1) {
+      await queueMetadataWrite(true);
+      return;
+    }
+
+    pendingRecords++;
+    if (pendingRecords >= METADATA_BATCH_MAX_RECORDS) {
+      void flushPending();
+      return;
+    }
+    if (saveTimer) {
+      return;
+    }
+
+    saveTimer = setTimeout(() => {
+      saveTimer = undefined;
+      void flushPending();
+    }, METADATA_BATCH_INTERVAL_MS);
   };
 
   let aborted = false;
@@ -764,7 +814,8 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
       await Promise.all(workers);
     }
 
-    await saveChain;
+    await flushPending();
+    await saveChain.catch(() => {});
     if (saveError) {
       fail(saveError, false);
       return null;
@@ -782,6 +833,11 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
 
     return { segmentPaths, ...(initPath ? { initPath } : {}) };
   } finally {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = undefined;
+    }
+    await flushPending();
     progress.finish();
     await rm(trackWorkDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -928,6 +984,33 @@ function registerInterruptHandlers(handler: (signal: NodeJS.Signals) => void): v
   }
 }
 
+function createValidationReporter(): {
+  onValidate: ResumeValidationCallback;
+  finish: () => void;
+} {
+  let progress: ValidationProgress | undefined;
+
+  return {
+    onValidate: state => {
+      if (!progress) {
+        if (state.totalFiles < 3) {
+          return;
+        }
+        progress = new ValidationProgress(
+          state.totalFiles,
+          state.totalBytes,
+          Boolean(stdout.isTTY),
+        );
+      }
+      progress.update(state.checkedFiles, state.checkedBytes);
+    },
+    finish: () => {
+      progress?.finish();
+      progress = undefined;
+    },
+  };
+}
+
 function resolveManifestUrl(uri: string, baseUrl: string): string {
   try {
     return new URL(uri, baseUrl).href;
@@ -982,7 +1065,13 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
   }
 
   console.log(`Validating segments in: ${dir}`);
-  const state = await loadResumeState(dir);
+  const validation = createValidationReporter();
+  let state: LoadedResumeState;
+  try {
+    state = await loadResumeState(dir, validation.onValidate);
+  } finally {
+    validation.finish();
+  }
   const { metadata } = state;
   const container: HlsContainer = metadata.container ?? 'mpegts';
 
@@ -1419,23 +1508,30 @@ async function main(): Promise<void> {
     await ensureFreeSpace(tmpDir, estimatedBytes + FREE_SPACE_MARGIN, 'download');
   }
 
-  const resume = await initializeResumeState({
-    dir: tmpDir,
-    sourceUrl: url,
-    persist: true,
-    tempDir: workDir,
-    video: { mediaPlaylistUrl: playlistUrl, segments, container, map },
-    ...(audioSegments && audioContainer && audioPlaylistUrl
-      ? {
-          audio: {
-            mediaPlaylistUrl: audioPlaylistUrl,
-            segments: audioSegments,
-            container: audioContainer,
-            map: audioMap,
-          },
-        }
-      : {}),
-  });
+  const validation = createValidationReporter();
+  let resume: ResumeState;
+  try {
+    resume = await initializeResumeState({
+      dir: tmpDir,
+      sourceUrl: url,
+      persist: true,
+      tempDir: workDir,
+      video: { mediaPlaylistUrl: playlistUrl, segments, container, map },
+      ...(audioSegments && audioContainer && audioPlaylistUrl
+        ? {
+            audio: {
+              mediaPlaylistUrl: audioPlaylistUrl,
+              segments: audioSegments,
+              container: audioContainer,
+              map: audioMap,
+            },
+          }
+        : {}),
+      onValidate: validation.onValidate,
+    });
+  } finally {
+    validation.finish();
+  }
 
   console.log(`Working dir: ${tmpDir}`);
   if (resume.completed.size > 0) {

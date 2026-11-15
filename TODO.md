@@ -30,5 +30,3 @@
 ## Post-1.0
 
 - DNS-rebinding pinning (documented limitation for 1.0)
-- Resume-validation progress for very large directories
-- Batched metadata writes under high concurrency

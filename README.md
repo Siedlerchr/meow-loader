@@ -300,8 +300,9 @@ files recorded by meow-loader.
 
 Resuming also works after a failed merge: the downloaded segments are still in
 the working directory printed during the run (`Working dir: ...`), so
-`--resume <dir>` validates them and merges again without downloading. The same
-playlist URL is re-fetched and checked; if it has changed, the resume is
+`--resume <dir>` validates them and merges again without downloading. Existing
+segments are hashed with a progress line showing files and bytes checked. The
+same playlist URL is re-fetched and checked; if it has changed, the resume is
 rejected.
 
 If the playlist endpoint is gone entirely, merge the saved directory offline:
