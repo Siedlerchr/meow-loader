@@ -62,3 +62,17 @@ jobs:
 
       - name: Publish to npm
         run: npm publish --access public
+
+      - name: Verify npm publish
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          for attempt in $(seq 1 30); do
+            if npm view "meow-loader@${VERSION}" version >/dev/null 2>&1; then
+              echo "meow-loader@${VERSION} is available on npm"
+              exit 0
+            fi
+            echo "Attempt ${attempt}/30: meow-loader@${VERSION} not visible yet; retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::meow-loader@${VERSION} was not visible on npm after 5 minutes"
+          exit 1
