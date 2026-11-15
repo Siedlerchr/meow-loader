@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { lstat, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { M3U8Map, M3U8Segment } from './m3u8-parser';
@@ -9,6 +9,8 @@ import { redactUrl } from './url';
 
 export const RESUME_METADATA_FILENAME = 'meow-loader.resume.json';
 const RESUME_VERSION = 2;
+const MAX_RESUME_SEGMENTS = 100_000;
+const MAX_RESUME_METADATA_BYTES = 64 * 1024 * 1024;
 
 export interface ResumeSegment {
   fileName: string;
@@ -100,8 +102,9 @@ export async function initializeResumeState(options: {
   }
 
   const metadataPath = join(options.dir, RESUME_METADATA_FILENAME);
-  if (existsSync(metadataPath)) {
-    const existing = parseMetadata(await readFile(metadataPath, 'utf8'), metadataPath);
+  const metadataInfo = await lstat(metadataPath).catch(() => undefined);
+  if (metadataInfo) {
+    const existing = parseMetadata(await readMetadataFile(metadataPath, metadataInfo), metadataPath);
 
     if (existing.sourceUrlHash !== expected.sourceUrlHash) {
       throw new Error(
@@ -161,18 +164,13 @@ export async function loadResumeState(
   onValidate?: ResumeValidationCallback,
 ): Promise<LoadedResumeState> {
   const metadataPath = join(dir, RESUME_METADATA_FILENAME);
-  let raw: string;
-
-  try {
-    raw = await readFile(metadataPath, 'utf8');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new Error(
-        `No ${RESUME_METADATA_FILENAME} found in ${dir}. Use --resume <dir> with the original playlist instead.`,
-      );
-    }
-    throw error;
+  const metadataInfo = await lstat(metadataPath).catch(() => undefined);
+  if (!metadataInfo) {
+    throw new Error(
+      `No ${RESUME_METADATA_FILENAME} found in ${dir}. Use --resume <dir> with the original playlist instead.`,
+    );
   }
+  const raw = await readMetadataFile(metadataPath, metadataInfo);
 
   const metadata = parseMetadata(raw, metadataPath);
   const onFile = createValidationReporter(
@@ -324,6 +322,7 @@ function isTrack(value: unknown, prefix: '' | 'audio_'): value is ResumeTrack {
     typeof track.mediaPlaylistUrlDisplay !== 'string' ||
     !Number.isInteger(track.segmentCount) ||
     (track.segmentCount ?? -1) < 0 ||
+    (track.segmentCount ?? -1) > MAX_RESUME_SEGMENTS ||
     typeof track.segmentFingerprint !== 'string' ||
     !track.segments ||
     typeof track.segments !== 'object' ||
@@ -358,6 +357,7 @@ function isTrack(value: unknown, prefix: '' | 'audio_'): value is ResumeTrack {
   for (const [key, segment] of Object.entries(track.segments)) {
     if (
       !/^\d+$/.test(key) ||
+      String(Number(key)) !== key ||
       !segment ||
       typeof segment !== 'object' ||
       typeof segment.fileName !== 'string' ||
@@ -390,6 +390,18 @@ function isInitSegment(value: unknown, prefix: '' | 'audio_'): value is ResumeIn
     typeof init.sha256 === 'string' &&
     /^[0-9a-f]{64}$/.test(init.sha256)
   );
+}
+
+async function readMetadataFile(path: string, info: Stats): Promise<string> {
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new Error(`Resume metadata must be a regular file: ${path}`);
+  }
+  if (info.size > MAX_RESUME_METADATA_BYTES) {
+    throw new Error(
+      `Resume metadata is ${info.size} bytes, above the ${MAX_RESUME_METADATA_BYTES} limit: ${path}`,
+    );
+  }
+  return readFile(path, 'utf8');
 }
 
 function invalidMetadataError(path: string): Error {

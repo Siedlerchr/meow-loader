@@ -40,9 +40,13 @@ It defends against:
   playlists depend on it; other request-specific headers are limited to the
   original request.
 - **Path traversal and arbitrary file writes from playlist data.** Segment and
-  init filenames are generated, resume metadata filenames are regex-validated,
-  FFmpeg concat inputs use generated relative names, and temporary files are
-  created in private `mkdtemp` directories or with exclusive creation.
+  init filenames are generated, resume metadata filenames and keys are
+  validated, FFmpeg concat inputs use generated relative names, and temporary
+  files are created in private `mkdtemp` directories or with exclusive
+  creation. Resume metadata must be a regular file, bounded to 64 MiB and
+  100,000 segments.
+- **Subtitle memory bounds.** Subtitle segments are streamed into a private
+  temporary file with a 64 MiB total cap instead of being retained in memory.
 - **Accidental overwrites.** Outputs are written to a private temporary
   directory, validated with ffprobe, and renamed. `--force` is explicit.
 - **Terminal escape injection.** Manifest-controlled strings are sanitized

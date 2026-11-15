@@ -35,7 +35,7 @@ import {
   ValidationProgress,
 } from './src/progress';
 import { validateMp4Output } from './src/output-validation';
-import { isValidWebVttSegment, mergeWebVttSegments } from './src/webvtt';
+import { isValidWebVttSegment, splitWebVttSegment } from './src/webvtt';
 import {
   cleanupResumeState,
   initializeResumeState,
@@ -63,12 +63,12 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   realpath,
   rename,
   rm,
   stat,
   statfs,
-  writeFile,
 } from 'node:fs/promises';
 import { constants, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -205,8 +205,10 @@ async function selectRenditionForGroup(
     console.log(`Available ${label} renditions:`);
     candidates.forEach((rendition, index) => {
       const details = [
-        rendition.language,
-        rendition.channels ? `${rendition.channels} channels` : undefined,
+        rendition.language ? sanitizeForDisplay(rendition.language, 40) : undefined,
+        rendition.channels
+          ? `${sanitizeForDisplay(rendition.channels, 20)} channels`
+          : undefined,
         rendition.default ? 'default' : undefined,
       ]
         .filter((value): value is string => Boolean(value))
@@ -491,8 +493,18 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
   }
 
   const concurrency = Math.max(1, Math.min(options.concurrency, Math.max(1, segments.length)));
+  const workDirInfo = await lstat(workDir).catch(() => undefined);
+  if (!workDirInfo?.isDirectory() || workDirInfo.isSymbolicLink()) {
+    throw new Error(`Working directory is not a real directory: ${workDir}`);
+  }
+
   const trackWorkDir = join(workDir, kind);
   await mkdir(trackWorkDir, { recursive: true });
+
+  const trackWorkDirInfo = await lstat(trackWorkDir).catch(() => undefined);
+  if (!trackWorkDirInfo?.isDirectory() || trackWorkDirInfo.isSymbolicLink()) {
+    throw new Error(`Track working directory is not a real directory: ${trackWorkDir}`);
+  }
 
   let currentBytes = trackBytes(track);
   const initFileName = `${prefix}init.${container === 'fmp4' ? 'mp4' : 'ts'}`;
@@ -531,16 +543,13 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
   let pendingRecords = 0;
   let saveTimer: NodeJS.Timeout | undefined;
 
-  const queueMetadataWrite = async (throwOnError: boolean): Promise<void> => {
+  const queueMetadataWrite = async (): Promise<void> => {
     saveChain = saveChain.then(async () => {
       if (saveError) return;
       try {
         await saveResumeMetadata(tmpDir, options.metadata, trackWorkDir);
       } catch (error) {
         saveError = error;
-        if (throwOnError) {
-          throw error;
-        }
       }
     });
     await saveChain;
@@ -555,15 +564,12 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
       return;
     }
     pendingRecords = 0;
-    await queueMetadataWrite(false);
+    await queueMetadataWrite();
   };
 
   const persist = async (): Promise<void> => {
-    if (concurrency === 1) {
-      await queueMetadataWrite(true);
-      return;
-    }
-
+    // A full metadata snapshot after every segment is quadratic; always batch
+    // writes and flush at the end (and on errors via the finally block).
     pendingRecords++;
     if (pendingRecords >= METADATA_BATCH_MAX_RECORDS) {
       void flushPending();
@@ -839,10 +845,18 @@ async function downloadTrack(options: DownloadTrackOptions): Promise<DownloadedT
     }
     await flushPending();
     progress.finish();
-    await rm(trackWorkDir, { recursive: true, force: true }).catch(() => {});
+    const currentWorkDirInfo = await lstat(workDir).catch(() => undefined);
+    if (currentWorkDirInfo?.isDirectory() && !currentWorkDirInfo.isSymbolicLink()) {
+      await removeOwnedDirectory(trackWorkDir);
+    } else {
+      console.warn(
+        `Warning: refusing to clean up ${trackWorkDir}: the working directory is not a real directory.`,
+      );
+    }
   }
 }
 const SUBTITLE_SEGMENT_MAX_BYTES = 16 * 1024 ** 2;
+const SUBTITLE_TOTAL_MAX_BYTES = 64 * 1024 ** 2;
 
 function renditionTag(rendition: M3U8Media): string {
   const raw = rendition.language || rendition.name || 'subs';
@@ -865,52 +879,6 @@ async function saveSubtitleSidecar(options: {
   maxSegmentBytes: number;
   budget: DownloadBudget;
 }): Promise<void> {
-  const texts: string[] = [];
-
-  for (const segment of options.segments) {
-    if (segment.byterange) {
-      throw new Error('Byte-range subtitle segments are not supported');
-    }
-
-    const remaining =
-      options.budget.maxBytes > 0
-        ? options.budget.maxBytes - options.budget.usedBytes
-        : Infinity;
-    if (remaining <= 0) {
-      throw new DownloadLimitError(
-        `Download limit reached (${formatBytes(options.budget.maxBytes)}) while downloading subtitles.`,
-      );
-    }
-
-    const maxBytes = Math.min(SUBTITLE_SEGMENT_MAX_BYTES, options.maxSegmentBytes, remaining);
-    const url = resolveUrl(segment.uri, options.playlistUrl);
-    const response = await options.network.fetch(url, {}, {
-      attempts: options.retries,
-      label: 'subtitle segment',
-      timeoutMs: options.timeoutMs,
-    });
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      throw new Error(
-        `Failed to download subtitle segment: ${redactUrl(url)} (${response.status})`,
-      );
-    }
-
-    const bytes = await readResponseBytes(response, maxBytes, 'Subtitle segment');
-    const text = new TextDecoder().decode(bytes);
-    if (!isValidWebVttSegment(text)) {
-      throw new Error(`Downloaded subtitle segment is not valid WebVTT: ${redactUrl(url)}`);
-    }
-
-    options.budget.usedBytes += bytes.byteLength;
-    texts.push(text);
-  }
-
-  const merged = mergeWebVttSegments(texts);
-  if (!merged.trim()) {
-    throw new Error('Subtitle playlist produced no cues');
-  }
-
   const parsed = parsePath(options.outputPath);
   const sidecar = join(parsed.dir, `${parsed.name}.${renditionTag(options.rendition)}.vtt`);
   const target = pickAvailableOutputPath(sidecar, options.force);
@@ -921,14 +889,102 @@ async function saveSubtitleSidecar(options: {
 
   const tempDir = await mkdtemp(join(parsed.dir, '.meow-subtitles-'));
   const tempPath = join(tempDir, 'subtitles.vtt');
+  const handle = await open(tempPath, 'wx', 0o600);
+  let headerWritten = false;
+  let cueCount = 0;
+  let totalBytes = 0;
+
   try {
-    await writeFile(tempPath, merged, { mode: 0o600, flag: 'wx' });
+    for (const segment of options.segments) {
+      if (segment.byterange) {
+        throw new Error('Byte-range subtitle segments are not supported');
+      }
+
+      const remaining =
+        options.budget.maxBytes > 0
+          ? options.budget.maxBytes - options.budget.usedBytes
+          : Infinity;
+      if (remaining <= 0) {
+        throw new DownloadLimitError(
+          `Download limit reached (${formatBytes(options.budget.maxBytes)}) while downloading subtitles.`,
+        );
+      }
+
+      const maxBytes = Math.min(SUBTITLE_SEGMENT_MAX_BYTES, options.maxSegmentBytes, remaining);
+      const url = resolveUrl(segment.uri, options.playlistUrl);
+      const response = await options.network.fetch(url, {}, {
+        attempts: options.retries,
+        label: 'subtitle segment',
+        timeoutMs: options.timeoutMs,
+      });
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {});
+        throw new Error(
+          `Failed to download subtitle segment: ${redactUrl(url)} (${response.status})`,
+        );
+      }
+
+      const bytes = await readResponseBytes(response, maxBytes, 'Subtitle segment');
+      totalBytes += bytes.byteLength;
+      if (totalBytes > SUBTITLE_TOTAL_MAX_BYTES) {
+        throw new Error(
+          `Subtitle download exceeds the ${formatBytes(SUBTITLE_TOTAL_MAX_BYTES)} limit`,
+        );
+      }
+
+      options.budget.usedBytes += bytes.byteLength;
+      const text = new TextDecoder().decode(bytes);
+      if (!isValidWebVttSegment(text)) {
+        throw new Error(`Downloaded subtitle segment is not valid WebVTT: ${redactUrl(url)}`);
+      }
+
+      const normalized = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').trim();
+      if (!normalized) {
+        continue;
+      }
+
+      const { header, body } = splitWebVttSegment(normalized);
+      if (!headerWritten) {
+        await handle.write(`${header || 'WEBVTT'}\n\n`);
+        headerWritten = true;
+      }
+
+      const cue = body.trim();
+      if (cue) {
+        if (cueCount > 0) {
+          await handle.write('\n\n');
+        }
+        await handle.write(cue);
+        cueCount++;
+      }
+    }
+
+    if (!headerWritten || cueCount === 0) {
+      throw new Error('Subtitle playlist produced no cues');
+    }
+
+    await handle.write('\n');
+    await handle.close();
     await replaceFile(tempPath, target.path);
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
   } finally {
-    await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    await removeOwnedDirectory(tempDir);
   }
 
   console.log(`Subtitles saved to: ${target.path}`);
+}
+
+async function removeOwnedDirectory(dir: string): Promise<void> {
+  const info = await lstat(dir).catch(() => undefined);
+  if (!info) return;
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    // Unlink symlinks/files instead of recursing through them.
+    await rm(dir, { force: true }).catch(() => {});
+    return;
+  }
+  await rm(dir, { recursive: true, force: true });
 }
 
 async function replaceFile(source: string, target: string): Promise<void> {
@@ -966,7 +1022,7 @@ async function cleanupWorkingDirectory(
   resume: ResumeState,
 ): Promise<void> {
   if (ownsTempDir) {
-    await rm(tmpDir, { recursive: true, force: true });
+    await removeOwnedDirectory(tmpDir);
     return;
   }
 
@@ -1093,15 +1149,17 @@ async function mergeDownloadedSegments(args: ParsedArgs, mergeDir: string): Prom
       );
     }
 
-    const missing: number[] = [];
+    let missingCount = 0;
+    let firstMissing: number | undefined;
     for (let index = 0; index < track.segmentCount; index++) {
       if (!completed.has(index)) {
-        missing.push(index);
+        missingCount++;
+        firstMissing ??= index;
       }
     }
-    if (missing.length > 0) {
+    if (missingCount > 0) {
       throw new Error(
-        `Cannot merge ${dir}: ${missing.length} of ${track.segmentCount} ${label}segments are missing or corrupt (first missing index: ${missing[0]}). Re-download with --resume ${dir} when the endpoint is available.`,
+        `Cannot merge ${dir}: ${missingCount} of ${track.segmentCount} ${label}segments are missing or corrupt (first missing index: ${firstMissing}). Re-download with --resume ${dir} when the endpoint is available.`,
       );
     }
   };
@@ -1668,7 +1726,7 @@ async function main(): Promise<void> {
       `Failed to finalize output: ${errorMessage(error)}\nSegments preserved at: ${tmpDir}\nResume later with: --resume ${tmpDir}`,
     );
   } finally {
-    await rm(outputTempDir, { recursive: true, force: true }).catch(() => {});
+    await removeOwnedDirectory(outputTempDir);
     outputTempDir = undefined;
   }
 

@@ -23,7 +23,7 @@ export function mergeWebVttSegments(segments: string[]): string {
       continue;
     }
 
-    const { header: segmentHeader, body } = splitHeader(normalized);
+    const { header: segmentHeader, body } = splitWebVttSegment(normalized);
     if (header === undefined && segmentHeader) {
       header = segmentHeader;
     }
@@ -45,7 +45,7 @@ export function mergeWebVttSegments(segments: string[]): string {
   return `${header.trimEnd()}\n\n${cues.join('\n\n')}\n`;
 }
 
-function splitHeader(text: string): { header: string; body: string } {
+export function splitWebVttSegment(text: string): { header: string; body: string } {
   if (!/^WEBVTT(?:\s|$)/.test(text)) {
     return { header: '', body: text };
   }

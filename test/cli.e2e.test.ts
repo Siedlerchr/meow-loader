@@ -88,6 +88,13 @@ const brokenSubtitleMasterPlaylist = `#EXTM3U
 av-video.m3u8
 `;
 
+const maliciousAudioMasterPlaylist = `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en\u001b]0;PWNED\u0007",DEFAULT=YES,URI="audio/playlist.m3u8?lang=en"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Spanish",LANGUAGE="es",CHANNELS="2\u001b[31mRED",DEFAULT=NO,URI="audio/playlist.m3u8?lang=es"
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,AUDIO="aud"
+av-video.m3u8
+`;
+
 const brokenSubtitlePlaylist = `#EXTM3U
 #EXT-X-TARGETDURATION:10
 #EXTINF:10,
@@ -325,6 +332,12 @@ media/all.mp4
       if (pathname === '/fmp4-bad/init.mp4') {
         response.writeHead(200, { 'content-type': 'video/mp4' });
         response.end('<html><body>not an initialization segment</body></html>');
+        return;
+      }
+
+      if (pathname === '/malicious-audio.m3u8') {
+        response.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+        response.end(maliciousAudioMasterPlaylist);
         return;
       }
 
@@ -1114,6 +1127,16 @@ media/all.mp4
     expect(stdout).toContain('Resuming with 2/3 segments already downloaded');
     expect(stdout).not.toContain('Downloading initialization segment');
     expect(stdout).toContain('Done! Saved to');
+  });
+
+  it('sanitizes terminal control characters in rendition metadata', async () => {
+    const output = join(tempRoot, 'malicious-rendition.mp4');
+    const { stdout } = await command([`${baseUrl}/malicious-audio.m3u8`, output]);
+
+    expect(stdout).toContain('Available audio renditions:');
+    expect(stdout).not.toContain('\u001b');
+    expect(stdout).not.toContain('\u0007');
+    expect(stdout).toContain('\\x1b');
   });
 
   it('downloads a separate audio rendition and muxes it', async () => {
