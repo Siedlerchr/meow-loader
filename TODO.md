@@ -10,8 +10,8 @@
 
 ## Cross-platform verification
 
-- [ ] Run CI on macOS and Windows (Node 22 and 24)
-- [ ] Fix platform-specific failures
+- [x] Run CI on macOS and Windows (Node 22 and 24)
+- [x] Fix platform-specific failures (none required)
 
 ## Subtitles (sidecar WebVTT)
 
