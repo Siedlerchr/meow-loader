@@ -352,7 +352,7 @@ segment.ts
     it('rejects byte ranges whose end overflows the safe integer range', () => {
       const content = `#EXTM3U
 #EXTINF:10,
-#EXT-X-BYTERANGE:${Number.MAX_SAFE_INTEGER}@1
+#EXT-X-BYTERANGE:${Number.MAX_SAFE_INTEGER}@2
 segment.ts
 #EXT-X-ENDLIST
 `;
