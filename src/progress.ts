@@ -91,7 +91,9 @@ export class DownloadProgress {
     const line = parts.join(' · ');
 
     if (this.tty) {
-      process.stdout.write(`\r${line}`);
+      // Erase the rest of the line: the new line can be shorter than the last
+      // one, which otherwise leaves stale characters such as "ETA 0:0272".
+      process.stdout.write(`\r${line}\x1b[K`);
       this.hasRendered = true;
     } else if (final) {
       const shouldLog =
